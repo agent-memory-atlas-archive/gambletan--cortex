@@ -178,7 +178,8 @@ fn test_store_link_upsert() {
 
 #[test]
 fn test_file_backed_wal_mode() {
-    let path = format!("/tmp/cortex_wal_test_{}.db", Uuid::new_v4());
+    let private_dir = tempfile::tempdir().unwrap();
+    let path = private_dir.path().join("memory.db").to_string_lossy().into_owned();
     let s = SqliteStorage::open(&path).unwrap();
 
     // Basic CRUD should work with WAL mode
@@ -199,7 +200,8 @@ fn test_file_backed_wal_mode() {
 
 #[test]
 fn test_file_backed_read_pool_concurrent() {
-    let path = format!("/tmp/cortex_pool_test_{}.db", Uuid::new_v4());
+    let private_dir = tempfile::tempdir().unwrap();
+    let path = private_dir.path().join("memory.db").to_string_lossy().into_owned();
     let s = SqliteStorage::open(&path).unwrap();
 
     for i in 0..20 {

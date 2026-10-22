@@ -240,7 +240,8 @@ fn test_retrieve_without_namespace_returns_all() {
 
 #[test]
 fn test_file_backed_storage_read_pool() {
-    let path = format!("/tmp/cortex_read_pool_{}.db", uuid::Uuid::new_v4());
+    let private_dir = tempfile::tempdir().unwrap();
+    let path = private_dir.path().join("memory.db").to_string_lossy().into_owned();
     let cortex = Cortex::open(&path).unwrap();
 
     // Ingest and retrieve — exercises read pool
@@ -260,7 +261,8 @@ fn test_file_backed_storage_read_pool() {
 
 #[test]
 fn test_file_backed_concurrent_reads() {
-    let path = format!("/tmp/cortex_concurrent_{}.db", uuid::Uuid::new_v4());
+    let private_dir = tempfile::tempdir().unwrap();
+    let path = private_dir.path().join("memory.db").to_string_lossy().into_owned();
     let cortex = Cortex::open(&path).unwrap();
 
     for i in 0..20 {

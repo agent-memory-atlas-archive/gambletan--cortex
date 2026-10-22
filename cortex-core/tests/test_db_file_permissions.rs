@@ -90,3 +90,15 @@ fn symlink_and_hardlink_database_aliases_fail_closed() {
     std::fs::hard_link(&target, &link).unwrap();
     assert!(Cortex::open(link.to_str().unwrap()).is_err());
 }
+
+#[test]
+fn shared_sticky_parent_requires_private_child_for_sidecar_safety() {
+    let dir=tempfile::tempdir().unwrap();
+    std::fs::set_permissions(dir.path(),std::fs::Permissions::from_mode(0o1777)).unwrap();
+    let unsafe_path=dir.path().join("unsafe.db");
+    assert!(Cortex::open(unsafe_path.to_str().unwrap()).is_err());
+    assert!(!unsafe_path.exists());
+    let private=dir.path().join("private");std::fs::create_dir(&private).unwrap();
+    std::fs::set_permissions(&private,std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(Cortex::open(private.join("memory.db").to_str().unwrap()).is_ok());
+}

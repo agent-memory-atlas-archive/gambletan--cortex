@@ -217,6 +217,15 @@ pub fn read_oplog(
             break; // EOF
         }
 
+        // A flush is not an atomic write: a scanner may observe a prefix while
+        // another process is appending. JSONL publication requires the newline.
+        // Leave the cursor at this record for both plaintext and encrypted tails.
+        if !line.ends_with('\n') {
+            use zeroize::Zeroize;
+            line.zeroize();
+            break;
+        }
+
         let trimmed = line.trim();
         if trimmed.is_empty() {
             offset += bytes_read as u64;
@@ -384,12 +393,8 @@ pub fn read_oplog(
                 offset += bytes_read as u64;
             }
             Err(_) => {
-                // Distinguish partial write (incomplete line) from permanent corruption:
-                // - If the raw line ends with '\n', it's a complete but corrupt line → skip it
-                // - If at EOF without '\n', it's likely a partial write → don't advance, retry
-                // Always advance past bad lines to avoid stalling sync.
-                // Partial writes (no trailing \n) are also skipped — the writer
-                // uses flush() which guarantees complete lines on disk.
+                // Only newline-terminated records reach this branch. Skip complete
+                // corrupt records; an incomplete tail above retains its cursor.
                 tracing::warn!("Skipping invalid oplog line at offset {}", offset);
 
                 // Zeroize plaintext JSON from memory

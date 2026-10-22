@@ -488,11 +488,22 @@ fn test_oplog_partial_line_recovery() {
         hmac: None,
     };
     let valid_line = serde_json::to_string(&op).unwrap();
-    std::fs::write(&file_path, format!("{}\n{{corrupt partial", valid_line)).unwrap();
+    let mut next=op.clone(); next.op_id=Uuid::new_v4();
+    let next_line=serde_json::to_string(&next).unwrap();
+    let split=next_line.len()/2;
+    std::fs::write(&file_path,format!("{}\n{}",valid_line,&next_line[..split])).unwrap();
 
-    let (ops, _) = oplog::read_oplog(&file_path, 0, None).unwrap();
+    let (ops, offset) = oplog::read_oplog(&file_path, 0, None).unwrap();
     assert_eq!(ops.len(), 1);
     assert_eq!(ops[0].op_id, op.op_id);
+    assert_eq!(offset, (valid_line.len()+1) as u64);
+    use std::io::Write;
+    let mut append=std::fs::OpenOptions::new().append(true).open(&file_path).unwrap();
+    writeln!(append,"{}",&next_line[split..]).unwrap();drop(append);
+    let (completed, final_offset)=oplog::read_oplog(&file_path,offset,None).unwrap();
+    assert_eq!(completed.len(),1);
+    assert_eq!(completed[0].op_id,next.op_id);
+    assert_eq!(final_offset,(valid_line.len()+next_line.len()+2) as u64);
 }
 
 #[test]
