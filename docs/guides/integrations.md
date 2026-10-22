@@ -298,7 +298,7 @@ async with MultiServerMCPClient({
 
 Your LangGraph agent gets instant access to `memory_search`, `memory_ingest`, `fact_add`, `belief_observe`, `person_resolve`, and 24 more tools -- all running locally.
 
-See the [LangGraph section in README.md](../README.md#integration-with-langgraph) for full details.
+See the [LangGraph section in README.md](../../README.md#integration-with-langgraph) for full details.
 
 ---
 
@@ -328,7 +328,7 @@ mcp_servers:
 
 All DeerFlow agents (Telegram, Slack, Feishu) get instant access to 29 memory tools -- cross-session memory, fact storage, people graph, and belief tracking across all channels.
 
-See the [DeerFlow section in README.md](../README.md#integration-with-deerflow-bytedance) for full details.
+See the [DeerFlow section in README.md](../../README.md#integration-with-deerflow-bytedance) for full details.
 
 ---
 
@@ -366,7 +366,7 @@ openclaw plugin add @cortex-ai-memory/cortex-memory
 - `autoRecall` -- injects relevant memories before each turn (your agent "remembers")
 - 7 tools: `memory_search`, `memory_store`, `fact_add`, `belief_observe`, `person_resolve`, and more
 
-See the [OpenClaw section in README.md](../README.md#openclaw-plugin) and [`openclaw-plugin/README.md`](../openclaw-plugin/README.md) for full configuration options.
+See the [OpenClaw section in README.md](../../README.md#openclaw-plugin) and [`openclaw-plugin/README.md`](../../openclaw-plugin/README.md) for full configuration options.
 
 ---
 
@@ -406,4 +406,4 @@ curl -X POST http://localhost:3315/v1/facts \
   -d '{"subject": "Alice", "predicate": "works_at", "object": "Stripe", "confidence": 0.95, "channel": "api"}'
 ```
 
-See the [HTTP API section in README.md](../README.md#http-api) for the full endpoint reference.
+See the [HTTP API section in README.md](../../README.md#http-api) for the full endpoint reference.
