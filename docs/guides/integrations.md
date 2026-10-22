@@ -2,6 +2,12 @@
 
 Cortex provides persistent, local-first memory for AI agents. This guide shows how to integrate Cortex with popular multi-agent frameworks.
 
+For hosted Bots that already own memory and permissions in PostgreSQL, follow the
+[controlled Bot integration architecture and plan](../design/bot-memory-integration.md).
+That proposed path uses Cortex only as a derived retrieval backend, with mandatory
+authoritative scope/version/withdrawal checks. Its controlled APIs are not implemented
+yet; the personal-agent examples below do not provide that hosted isolation contract.
+
 **What Cortex adds to any framework:**
 
 - **Persistent memory** -- 4-tier (Working / Episodic / Semantic / Procedural) that survives across sessions

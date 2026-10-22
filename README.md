@@ -137,6 +137,21 @@ Cortex implements a 4-tier memory model inspired by human cognition:
 
 **Working** holds the current session scratch pad. **Episodic** stores raw experiences with timestamps and source metadata. The **Consolidation Engine** periodically promotes recurring patterns into **Semantic** facts and decays stale episodes. **Procedural** captures learned workflows and routines.
 
+### Bot integration architecture (proposed)
+
+For a hosted Bot with existing PostgreSQL memory and account permissions, Cortex is an
+optional derived retrieval backend behind its MemoryManager. PostgreSQL remains the
+authority for confirmed values, scope, provenance, revisions and withdrawal;
+ContextProjector remains the single model-context composer, and Workflow keeps execution
+and approvals. Search hits must pass current authoritative validation before entering
+model context. A controlled projection store must not import personal archives or enable
+sync, automatic inference or consolidation by default.
+
+The [Bot memory integration plan](docs/design/bot-memory-integration.md) defines the
+proposed controlled-store contract, Cortex versus host responsibilities, implementation
+order, failure recovery and acceptance. It is a design, not an available SDK API or a
+deployed Bot integration; existing personal-agent integration paths below are unchanged.
+
 ## Key Components
 
 ### People Graph
