@@ -1,7 +1,10 @@
 //! A disposable, scope-constrained projection of host-authoritative memory.
 //! Never invokes ingest, plugins, inference, sync, or consolidation.
 use crate::retrieval::{QueryBudget, RetrievalEngine, RetrievalQuery};
-use crate::storage::{memory_index::MemoryIndex, sqlite::SqliteStorage};
+use crate::storage::{
+    memory_index::{cosine_similarity, MemoryIndex},
+    sqlite::SqliteStorage,
+};
 use crate::types::{MemContent, MemObject, MemObjectBuilder, MemSource, MemoryTier};
 use chrono::{DateTime, Utc};
 use parking_lot::Mutex;
@@ -48,8 +51,11 @@ impl From<rusqlite::Error> for ControlledError {
     }
 }
 impl From<crate::CortexError> for ControlledError {
-    fn from(_: crate::CortexError) -> Self {
-        Self::Storage
+    fn from(error: crate::CortexError) -> Self {
+        match error {
+            crate::CortexError::InvalidInput(_) => Self::InvalidInput("database mode"),
+            _ => Self::Storage,
+        }
     }
 }
 type Fence = (String, i64, Option<String>, bool, Option<String>);
@@ -398,6 +404,10 @@ impl ControlledStore {
         s.closed = true;
     }
     pub fn reconcile(&self, generation: &str, position: i64) -> Result<Status> {
+        ident(generation)?;
+        if position < 0 {
+            return Err(ControlledError::InvalidInput("position"));
+        }
         let mut s = self.state.lock();
         s.ready = false;
         let v = Self::status_locked(&s)?;
@@ -564,7 +574,16 @@ impl ControlledStore {
         for scope in scopes {
             scope_check(scope, &self.identity)?;
         }
-        let s = self.state.lock();
+        let started = Instant::now();
+        let duration = Duration::from_millis(max_duration_ms);
+        let deadline = started + duration;
+        let Some(s) = self.state.try_lock_until(deadline) else {
+            return Ok(SearchResult {
+                hits: vec![],
+                degraded: true,
+                truncated: true,
+            });
+        };
         let status = Self::status_locked(&s)?;
         if !status.ready {
             return Err(ControlledError::NotReady);
@@ -577,8 +596,6 @@ impl ControlledStore {
         if scopes.is_empty() {
             return Ok(empty());
         }
-        let started = Instant::now();
-        let duration = Duration::from_millis(max_duration_ms);
         let mut scope_json: Vec<String> = scopes.iter().map(json).collect::<Result<_>>()?;
         scope_json.sort();
         scope_json.dedup();
@@ -617,26 +634,29 @@ impl ControlledStore {
                 truncated: true,
             });
         };
-        let truncated = fetched.len() > max_candidates;
+        let mut truncated = fetched.len() > max_candidates;
         fetched.truncate(max_candidates);
+        // Share the existing scorer and cosine math, but never construct an HNSW
+        // graph for a request-local candidate set. Each vector is bounded to 4096
+        // dimensions and the deadline is checked between candidates.
         let index = MemoryIndex::new();
         let mut mems = HashMap::new();
         let mut lexical = HashMap::new();
         let mut scores = HashMap::new();
         for (mem, matched) in fetched {
-            if let Some(v) = &mem.embedding {
-                index.insert_arc(mem.id, v);
+            if Instant::now() >= deadline {
+                truncated = true;
+                break;
             }
+            let score = match (&embedding, &mem.embedding) {
+                (Some(query), Some(vector)) => cosine_similarity(query, vector),
+                _ => 0.5,
+            };
             if matched {
                 lexical.insert(mem.id, 1.0);
             }
-            scores.insert(mem.id, 0.5);
+            scores.insert(mem.id, score);
             mems.insert(mem.id, Arc::new(mem));
-        }
-        if let Some(v) = &embedding {
-            for (id, score) in index.search(v, max_candidates) {
-                scores.insert(id, score);
-            }
         }
         let mut q = RetrievalQuery::new(query, limit);
         q.embedding = embedding;
@@ -644,10 +664,19 @@ impl ControlledStore {
             max_candidates,
             max_duration: duration,
         };
-        let ranked = RetrievalEngine::new(&s.storage, &index)
-            .rank_candidates(&q, &scores, &mems, &lexical)?;
+        let ranked = RetrievalEngine::new(&s.storage, &index).rank_candidates(
+            &q,
+            &scores,
+            &mems,
+            &lexical,
+            Some(deadline),
+        )?;
         let mut hits = Vec::new();
         for r in ranked {
+            if Instant::now() >= deadline {
+                truncated = true;
+                break;
+            }
             let projection: Projection = serde_json::from_value(
                 r.memory
                     .metadata

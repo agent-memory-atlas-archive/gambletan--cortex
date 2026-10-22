@@ -367,6 +367,39 @@ class ControlledStoreAcceptance(unittest.TestCase):
         ])
         self.assertEqual({h["memory_id"] for h in self.hits(store)}, {"current"})
 
+    def test_large_semantic_search_obeys_budget_and_preserves_responsiveness(self):
+        store = self.open()
+        vector = [0.01 * ((i % 7) + 1) for i in range(128)]
+        for offset in range(0, 1100, 100):
+            store.seed([projection("budget-%d" % i, embedding=vector)
+                        for i in range(offset, offset + 100)])
+        store.finish_snapshot(100)
+        self.reconcile(store)
+        begin = time.monotonic()
+        result = store.search("orchid", [SCOPE], limit=100, embedding=vector,
+                              max_candidates=1100, max_duration_ms=250)
+        elapsed = time.monotonic() - begin
+        # Allow substantial CI scheduling/serialization overhead beyond the
+        # native budget; this catches runaway work, not a real-time SLA.
+        self.assertLess(elapsed, 2.0, "semantic search exceeded bounded-work allowance")
+        self.assertLessEqual(len(result["hits"]), 100)
+        self.assertIsInstance(result["degraded"], bool)
+        self.assertIsInstance(result["truncated"], bool)
+        if elapsed >= 0.250:
+            self.assertTrue(result["degraded"] or result["truncated"],
+                            "budget exhaustion must be explicit")
+        self.assertTrue(all(hit["scope"] == SCOPE for hit in result["hits"]))
+        begin = time.monotonic()
+        receipt = store.upsert(projection("after-budget-search", embedding=vector), 101)
+        self.assertLess(time.monotonic() - begin, 2.0,
+                        "search left later mutation unresponsive")
+        self.assertTrue(receipt["durable"])
+        self.assertEqual(store.status()["position"], 101)
+        begin = time.monotonic()
+        store.close()
+        self.assertLess(time.monotonic() - begin, 2.0,
+                        "search left close unresponsive")
+
     def test_long_native_operation_releases_gil(self):
         store = self.open()
         values = [projection("gil-%d" % i, text="orchid " + "x"*11990,

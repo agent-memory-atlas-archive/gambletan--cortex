@@ -50,7 +50,7 @@ impl PyCortex {
         embedding: Option<Vec<f32>>,
     ) -> PyResult<Vec<(String, f32, String)>> {
         let pid = person_id
-            .map(|s| uuid::Uuid::parse_str(s))
+            .map(uuid::Uuid::parse_str)
             .transpose()
             .map_err(|e| PyRuntimeError::new_err(format!("Invalid UUID: {}", e)))?;
 
@@ -90,7 +90,7 @@ impl PyCortex {
         person_id: Option<&str>,
     ) -> PyResult<String> {
         let pid = person_id
-            .map(|s| uuid::Uuid::parse_str(s))
+            .map(uuid::Uuid::parse_str)
             .transpose()
             .map_err(|e| PyRuntimeError::new_err(format!("Invalid UUID: {}", e)))?;
 
