@@ -13,10 +13,10 @@ pip install cortex-ai-memory
 ## Quick Start
 
 ```python
-from cortex_python import PyCortex
+from cortex_ai_memory import Cortex
 
 # Open or create a memory database
-cx = PyCortex("memory.db")
+cx = Cortex("memory.db")
 
 # Ingest memories
 cx.ingest("Met Alice at the Q3 planning meeting", "slack", user_id="alice_123")
@@ -76,3 +76,16 @@ results = cx.retrieve("where do I live?", 5, embedding=embed("where do I live?")
 ## License
 
 MIT
+
+## Hosted Bot projections
+
+`ControlledStore` provides an isolated, durable projection backend without ingest-time
+inference or consolidation. See the [controlled API contract](../docs/controlled-memory-api.md)
+for snapshot/replay reconciliation, immutable scopes, typed dictionaries, error codes,
+query bounds and a complete example. The caller retains PostgreSQL authority and must
+revalidate every hit before use. `Cortex` remains the personal-agent interface.
+
+The wheel uses plaintext SQLite. Controlled roots and all artifacts are owner-only;
+this does not replace your host's approved storage encryption or retention policy.
+Native controlled operations release the GIL, but the host still needs bounded worker
+capacity and a PostgreSQL fallback. No public HTTP service or cloud sync is enabled.

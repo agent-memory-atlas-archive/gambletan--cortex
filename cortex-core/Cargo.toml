@@ -14,7 +14,7 @@ uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-rusqlite = { version = "0.31", features = ["bundled"] }
+rusqlite = { version = "0.31", features = ["bundled", "hooks"] }
 thiserror = "1"
 tracing = "0.1"
 parking_lot = "0.12"
@@ -47,3 +47,6 @@ harness = false
 [[bench]]
 name = "comparison_bench"
 harness = false
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

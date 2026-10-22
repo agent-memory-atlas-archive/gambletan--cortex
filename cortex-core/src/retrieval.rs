@@ -283,6 +283,15 @@ impl<'a> RetrievalEngine<'a> {
         let memories = self.storage.get_memories_batch(&all_ids)?;
         let mem_map: HashMap<Uuid, Arc<MemObject>> = memories.into_iter().map(|m| (m.id, Arc::new(m))).collect();
 
+        self.rank_candidates(query, &candidate_scores, &mem_map, &fts_scores)
+    }
+
+    /// Shared ranking for candidates already constrained by a trusted scope predicate.
+    pub(crate) fn rank_candidates(
+        &self, query: &RetrievalQuery, candidate_scores: &HashMap<Uuid, f32>,
+        mem_map: &HashMap<Uuid, Arc<MemObject>>, fts_scores: &HashMap<Uuid, f32>,
+    ) -> Result<Vec<RetrievalResult>, CortexError> {
+        let temporal_intent = detect_temporal_intent(&query.text);
         // Adapt weights for temporal queries
         let weights = match temporal_intent {
             TemporalIntent::None => self.weights.clone(),
@@ -343,7 +352,7 @@ impl<'a> RetrievalEngine<'a> {
 
         // Score each candidate
         let mut results = Vec::new();
-        for (&id, &sim_score) in &candidate_scores {
+        for (&id, &sim_score) in candidate_scores {
             if let Some(mem) = mem_map.get(&id) {
                 // Namespace isolation: skip memories that don't match requested namespace
                 if let Some(ref ns) = query.namespace {

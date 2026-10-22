@@ -158,10 +158,43 @@ impl SqliteStorage {
     }
 
     fn open_keyed(path: &str, key: Option<DbKey>, readers: usize) -> Result<Self, CortexError> {
+        Self::open_keyed_mode(path, key, readers, false)
+    }
+
+    pub(crate) fn open_controlled(path: &str) -> Result<Self, CortexError> {
+        let storage = Self::open_keyed_mode(path, None, 1, true)?;
+        storage.with_write_conn(|conn| {
+            conn.execute_batch("PRAGMA synchronous=FULL;")
+                .map_err(|e| CortexError::Storage(e.to_string()))
+        })?;
+        Ok(storage)
+    }
+
+    fn open_keyed_mode(path: &str, key: Option<DbKey>, readers: usize, controlled: bool) -> Result<Self, CortexError> {
         #[cfg(unix)]
         Self::restrict_db_file_mode(path)?;
         let conn = Connection::open(path).map_err(|e| CortexError::Storage(e.to_string()))?;
         Self::apply_key(&conn, key.as_ref())?;
+
+        let marked: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='cortex_controlled_marker')", [], |r| r.get(0)
+        ).map_err(|e| CortexError::Storage(e.to_string()))?;
+        if marked && !controlled {
+            return Err(CortexError::InvalidInput("controlled database requires ControlledStore".into()));
+        }
+        if controlled && !marked {
+            let nonempty: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name NOT LIKE 'sqlite_%')", [], |r| r.get(0)
+            ).map_err(|e| CortexError::Storage(e.to_string()))?;
+            if nonempty { return Err(CortexError::InvalidInput("cannot import a personal database".into())); }
+            conn.execute_batch("BEGIN IMMEDIATE; CREATE TABLE cortex_controlled_marker(version INTEGER NOT NULL); INSERT INTO cortex_controlled_marker VALUES(1); COMMIT;")
+                .map_err(|e| CortexError::Storage(e.to_string()))?;
+        }
+        if controlled {
+            let version: i64 = conn.query_row("SELECT version FROM cortex_controlled_marker", [], |r| r.get(0))
+                .map_err(|e| CortexError::Storage(e.to_string()))?;
+            if version != 1 { return Err(CortexError::InvalidInput("unsupported controlled store format".into())); }
+        }
 
         conn.execute_batch(
             "PRAGMA journal_mode=WAL;
@@ -216,7 +249,7 @@ impl SqliteStorage {
     /// index, then fold the WAL back into the (zero-scrubbed) database and truncate it so
     /// the plaintext does not linger in old WAL frames. Best effort: a reader holding a
     /// snapshot can block the checkpoint; the next delete or autocheckpoint retries.
-    fn scrub_after_delete(conn: &Connection) {
+    pub(crate) fn scrub_after_delete(conn: &Connection) {
         let fts_secure_delete = conn
             .query_row(
                 "SELECT v FROM memories_fts_config WHERE k = 'secure-delete'",
@@ -288,6 +321,56 @@ impl SqliteStorage {
         f(&conn)
     }
 
+    pub(crate) fn insert_on_connection(conn: &Connection, mem: &MemObject) -> Result<(), CortexError> {
+        let now = Utc::now().to_rfc3339();
+        let embedding_blob = mem.embedding.as_ref().map(|e| f32_vec_to_bytes(e));
+        let content_json = serde_json::to_string(&mem.content).unwrap();
+        let id_str = mem.id.to_string();
+        let (fact_subject, fact_object, pref_key) = extract_materialized_columns(&mem.content);
+        let mut stmt = conn
+            .prepare_cached(
+                "INSERT INTO memories (id, tier, content_json, embedding_blob, temporal_json, source_json, salience_json, privacy_json, tags_json, metadata_json, links_json, content_hash, namespace, salience_score, fact_subject, fact_object, pref_key, source_channel, source_identity_id, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
+            )
+            .map_err(|e| CortexError::Storage(e.to_string()))?;
+        stmt.execute(params![
+                id_str,
+                mem.tier.as_str(),
+                content_json,
+                embedding_blob,
+                serde_json::to_string(&mem.temporal).unwrap(),
+                serde_json::to_string(&mem.source).unwrap(),
+                serde_json::to_string(&mem.salience).unwrap(),
+                serialize_privacy(&mem.privacy),
+                serialize_tags(&mem.tags),
+                serialize_metadata(&mem.metadata),
+                serialize_links(&mem.links),
+                mem.content_hash,
+                mem.namespace,
+                mem.salience.effective_score,
+                fact_subject,
+                fact_object,
+                pref_key,
+                mem.source.channel,
+                mem.source.identity_id.map(|id| id.to_string()),
+                now,
+                now,
+            ])
+            .map_err(|e| CortexError::Storage(e.to_string()))?;
+
+        Ok(())
+    }
+
+    pub(crate) fn invalidate_controlled_cache(&self) {
+        self.mem_cache.lock().clear();
+        self.entity_cache.lock().clear();
+    }
+
+    pub(crate) fn with_controlled_conn<F, R, E>(&self, f: F) -> Result<R, E>
+    where F: FnOnce(&Connection) -> Result<R, E> {
+        f(&self.write_conn.lock())
+    }
+
     /// Invalidate a single entry from the memory cache.
     fn cache_evict(&self, id: &Uuid) {
         self.mem_cache.lock().pop(id);
@@ -317,7 +400,7 @@ impl SqliteStorage {
         })
     }
 
-    fn parse_mem_row(row: &rusqlite::Row) -> Result<MemObject, rusqlite::Error> {
+    pub(crate) fn parse_mem_row(row: &rusqlite::Row) -> Result<MemObject, rusqlite::Error> {
         let id_str: String = row.get(0)?;
         let tier_str: String = row.get(1)?;
         let content_json: String = row.get(2)?;
@@ -726,43 +809,7 @@ impl StorageBackend for SqliteStorage {
 
     fn store_memory(&self, mem: &MemObject) -> Result<(), CortexError> {
         let conn = self.write_conn.lock();
-        let now = Utc::now().to_rfc3339();
-        let embedding_blob = mem.embedding.as_ref().map(|e| f32_vec_to_bytes(e));
-        let content_json = serde_json::to_string(&mem.content).unwrap();
-        let id_str = mem.id.to_string();
-        let (fact_subject, fact_object, pref_key) = extract_materialized_columns(&mem.content);
-        let mut stmt = conn
-            .prepare_cached(
-                "INSERT INTO memories (id, tier, content_json, embedding_blob, temporal_json, source_json, salience_json, privacy_json, tags_json, metadata_json, links_json, content_hash, namespace, salience_score, fact_subject, fact_object, pref_key, source_channel, source_identity_id, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
-            )
-            .map_err(|e| CortexError::Storage(e.to_string()))?;
-        stmt.execute(params![
-                id_str,
-                mem.tier.as_str(),
-                content_json,
-                embedding_blob,
-                serde_json::to_string(&mem.temporal).unwrap(),
-                serde_json::to_string(&mem.source).unwrap(),
-                serde_json::to_string(&mem.salience).unwrap(),
-                serialize_privacy(&mem.privacy),
-                serialize_tags(&mem.tags),
-                serialize_metadata(&mem.metadata),
-                serialize_links(&mem.links),
-                mem.content_hash,
-                mem.namespace,
-                mem.salience.effective_score,
-                fact_subject,
-                fact_object,
-                pref_key,
-                mem.source.channel,
-                mem.source.identity_id.map(|id| id.to_string()),
-                now,
-                now,
-            ])
-            .map_err(|e| CortexError::Storage(e.to_string()))?;
-
-        // FTS5 synced via trigger (memories_fts_ai)
+        Self::insert_on_connection(&conn, mem)?;
         self.cache_put(mem);
         Ok(())
     }

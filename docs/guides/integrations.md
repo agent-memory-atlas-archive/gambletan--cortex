@@ -4,9 +4,10 @@ Cortex provides persistent, local-first memory for AI agents. This guide shows h
 
 For hosted Bots that already own memory and permissions in PostgreSQL, follow the
 [controlled Bot integration architecture and plan](../design/bot-memory-integration.md).
-That proposed path uses Cortex only as a derived retrieval backend, with mandatory
-authoritative scope/version/withdrawal checks. Its controlled APIs are not implemented
-yet; the personal-agent examples below do not provide that hosted isolation contract.
+That path uses Cortex only as a derived retrieval backend, with mandatory authoritative
+scope/version/withdrawal checks. The [ControlledStore API](../controlled-memory-api.md)
+defines the implemented Cortex-side contract; the host adapter remains the caller's
+responsibility. The personal-agent examples below do not provide hosted isolation.
 
 **What Cortex adds to any framework:**
 
@@ -50,10 +51,13 @@ pip install crewai cortex-ai-memory
 
 ```python
 from crewai import Agent, Task, Crew
-from cortex_ai_memory import PyCortex
+from cortex_ai_memory import Cortex
+from pathlib import Path
 
 # Initialize Cortex (creates or opens a local SQLite database)
-cx = PyCortex("~/.cortex/crewai.db")
+memory_dir = Path.home() / ".cortex"
+memory_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+cx = Cortex(str(memory_dir / "crewai.db"))
 
 
 def cortex_recall(query: str) -> str:
@@ -123,9 +127,12 @@ cx.add_preference("report_style", "concise with bullet points", 0.9)
 ### Storing Facts and Beliefs Between Runs
 
 ```python
-from cortex_ai_memory import PyCortex
+from cortex_ai_memory import Cortex
+from pathlib import Path
 
-cx = PyCortex("~/.cortex/crewai.db")
+memory_dir = Path.home() / ".cortex"
+memory_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+cx = Cortex(str(memory_dir / "crewai.db"))
 
 # Store structured knowledge that agents can query later
 cx.add_fact("Alice", "works_at", "Stripe", 0.95, "crewai")
@@ -165,10 +172,13 @@ from autogen_agentchat.agents import AssistantAgent
 from autogen_agentchat.teams import RoundRobinGroupChat
 from autogen_agentchat.conditions import TextMentionTermination
 from autogen_ext.models.openai import OpenAIChatCompletionClient
-from cortex_ai_memory import PyCortex
+from cortex_ai_memory import Cortex
+from pathlib import Path
 
 # Initialize Cortex
-cx = PyCortex("~/.cortex/autogen.db")
+memory_dir = Path.home() / ".cortex"
+memory_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+cx = Cortex(str(memory_dir / "autogen.db"))
 
 
 def memory_search(query: str) -> str:
@@ -242,9 +252,12 @@ asyncio.run(main())
 ### Session Lifecycle Pattern
 
 ```python
-from cortex_ai_memory import PyCortex
+from cortex_ai_memory import Cortex
+from pathlib import Path
 
-cx = PyCortex("~/.cortex/autogen.db")
+memory_dir = Path.home() / ".cortex"
+memory_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+cx = Cortex(str(memory_dir / "autogen.db"))
 
 # --- Start of session: load context ---
 context = cx.get_context(2000)

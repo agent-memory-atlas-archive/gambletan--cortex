@@ -1097,8 +1097,13 @@ fn test_background_sync_detects_changes() {
     )
     .unwrap();
 
-    // Wait for debounce + processing time
-    std::thread::sleep(Duration::from_millis(1500));
+    // Native FSEvents may coalesce delivery for several seconds before our
+    // debounce even starts. Wait for the observable callback, retaining a bounded
+    // failure deadline rather than assuming a platform scheduling latency.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while call_count.load(Ordering::SeqCst) == 0 && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
 
     let count = call_count.load(Ordering::SeqCst);
     assert!(

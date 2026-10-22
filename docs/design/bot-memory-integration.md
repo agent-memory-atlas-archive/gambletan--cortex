@@ -1,6 +1,6 @@
 # Cortex integration with Bot memory: implementation plan
 
-Date: 2026-10-22. Status: design only; no runtime implementation, migration, release, or deployment.
+Date: 2026-10-22. Status: Cortex controlled core and Python binding implemented on this branch; host integration, package publication and deployment are not completed.
 
 ## 1. Goal and fixed boundaries
 
@@ -27,13 +27,13 @@ Cortex baseline: `00f0e38da36bdafc8b40cf235aaac9e53bdf8548` (origin/main when pl
 | [storage](../../cortex-core/src/storage/sqlite.rs) and [storage trait](../../cortex-core/src/storage/traits.rs) | SQLite transactions, CRUD, FTS triggers, memory cache | Atomic projection payload/state changes, stale-write fencing, and controlled-store lifecycle |
 | [core deletion](../../cortex-core/src/lib.rs), `delete_memory` | SQL removal, index removal, cache generation, deletion event | External identity/tombstone handling and crash/race acceptance; a normal delete alone does not reject a later stale projection |
 | [Python binding](../../cortex-python/src/lib.rs) | Existing PyO3 package and native engine | Current API lacks namespace arguments and delete exposure; retrieve returns only ID/score/text, without verification metadata |
-| [HTTP guard](../../cortex-http/src/main.rs), `guard_origin` | Preserve existing local-only use | The local HTTP API has no authentication and can read Private memories; it is not a tenant service |
+| [HTTP guard](../../cortex-http/src/main.rs), local server entrypoint | Preserve existing local-only use | The local HTTP API has no authentication and can read Private memories; it is not a tenant service |
 
 The Python README example currently uses `cortex_python.PyCortex`, while the module/class declarations are `cortex_ai_memory.Cortex`. Verify the installed wheel and repair examples as part of the binding package work; do not infer installability from a source import.
 
 An open wheel-build PR (#14 at planning time) owns macOS deployment-target fixes. Coordinate with that work instead of duplicating or overwriting its changes. This plan makes no claims about current published wheel availability.
 
-The original local checkout also contains security commits outside this main baseline, including `c1d8658` (owner-only database files) and `5f522d6` (plaintext deletion). Verify their current PR/merge ownership before implementing related protections. They are not treated as shipped main capabilities here, and this plan neither copies nor overrides them.
+The original owner-only database and plaintext-deletion fixes (`c1d8658`, `5f522d6`) have been reused as original cherry-picked commits in this branch, with conflicts resolved to preserve current main. Their tests and full diff are included in implementation review; they were not shipped main capabilities at the planning baseline.
 
 ## 3. First delivery and responsibilities
 
@@ -48,7 +48,7 @@ Use the existing Python binding as the first integration surface. Extend it with
 | Studio | Install the reviewed chatbot-agent/vendor package using the existing release process; retain current identity and permissions; no direct Cortex browser calls |
 | Bot design owner | Record the optional retrieval backend and precise acceptance mapping in the existing design/roadmap |
 
-All API names below are proposed. No listed method or acceptance result is implemented by this document.
+The implemented Cortex/Python surface is specified in the [controlled memory API](../controlled-memory-api.md). Host PostgreSQL delivery and authorization behavior below remains the integration contract; no host or real-account acceptance is implied.
 
 ## 4. Controlled projection contract (P0)
 
@@ -109,7 +109,7 @@ Logical withdrawal and physical erasure are distinct: no immediate wiping of exi
 
 ## 5. Python delivery and operational fallback (P0)
 
-Expose controlled open/upsert/delete/search/status/close through one documented binding; choose final names in the first contract package. Errors distinguish invalid scope/input, stale revision, equal-revision conflict, busy/not-ready store, and bounded retrieval degradation. Search results must not require parsing a generated prompt or tuple text to recover identity.
+The Python `ControlledStore` binding exposes open/seed/finish_snapshot/reconcile/apply_batch/upsert/delete/search/status/close; exact dictionary schemas and limits are in the [API contract](../controlled-memory-api.md). Errors distinguish invalid scope/input, stale revision, equal-revision conflict, busy/not-ready store, and bounded retrieval degradation. Search results must not require parsing a generated prompt or tuple text to recover identity.
 
 P0 runtime uses a supported wheel installed in a clean environment, not an adjacent Rust checkout. Add a built-wheel smoke/integration test covering import/class name, controlled APIs, restart, and scope/delete behavior. Rust workspace CI excludes cortex-python and therefore cannot substitute for this test. Verify the host's actual Python, OS, and architecture; add the binding job to the required integration checks rather than treating a skipped release workflow as acceptance. Coordinate macOS fixes with PR #14.
 
@@ -142,7 +142,7 @@ Implement on isolated branches against current main, preserving others' work. Ea
 
 W1 and W2 follow W0; W3 can use contract fixtures while W1/W2 develop, but integration waits for both. W4 waits for W1-W3. W5 is optional after W4 and cannot block the P0 retrieval release.
 
-## 8. Acceptance matrix (required, not executed)
+## 8. Acceptance matrix and ownership
 
 Use synthetic memory identities/text, real temporary SQLite and real test PostgreSQL where indicated. No production archive import, private model photos, paid generation, or publishing is necessary. Failure injection uses actual process termination and real files/transactions, not mocks in place of storage acceptance.
 
@@ -171,9 +171,11 @@ Use synthetic memory identities/text, real temporary SQLite and real test Postgr
 
 An acceptance subagent must be context-isolated from implementation: give it this plan and public schemas/docs, not implementation diffs or unit tests. Implementers write unit tests separately. Adversarial review is a third independent context, per repository rules.
 
+Cortex-side automated evidence includes the independent installed-wheel acceptance suite (16 cases covering C01-C13 and local crash/restore parts of C16), core unit fault injection and legacy regression suites. C14-C18 still require the Bot/Studio adapter and real PostgreSQL; no passing local test substitutes for those.
+
 ## 9. Review, CI, rollout and evidence
 
-For this documentation change, validate local links, fences, acceptance IDs, and `git diff --check`. No business acceptance is claimed. Keep the exact reviewed document content and head/base identifiers with raw model outputs in a traceable review record. Each model first reviews independently; cross-check only after both initial findings are saved. Fix every valid actionable finding at every severity, then repeat both reviews over the entire final diff; disputed findings require the originating reviewer to confirm closure.
+For this implementation, validate local links, fences, acceptance IDs and `git diff --check`, plus the required source and installed-wheel checks. No Bot/Studio business acceptance is claimed. Keep the exact reviewed document content and head/base identifiers with raw model outputs in a traceable review record. Each model first reviews independently; cross-check only after both initial findings are saved. Fix every valid actionable finding at every severity, then repeat both reviews over the entire final diff; disputed findings require the originating reviewer to confirm closure.
 
 Before any implementation merge, require two different underlying reviewer models independently clean on the final complete head/base and all required CI on that same integration version. Recheck head/base, conflicts, findings and checks immediately before merging with exact-head constraint. Follow the authorized admin merge policy only after these gates; do not bypass failed/missing/skipped required checks. A main failure or base movement requires investigation and fresh evidence, not inherited clean conclusions.
 
@@ -181,4 +183,4 @@ Required implementation verification includes `cargo test --workspace --exclude 
 
 Rollout uses a clean main containing the latest release and the existing package/vendor process: test environment first, then explicitly authorized scope. Record Cortex/chatbot-agent/Studio SHAs, wheel identity, flags, storage/replica configuration, CI runs, each reviewer model/round, fault-injection results and unresolved limits. Verify actual installed package, processes, health, replay lag, cleanup failures, logs and recall/correction/forget behavior after release. Separate implementation, isolated tests, deployment and real authorized end-to-end acceptance; anything not deployed must be labeled not deployed.
 
-Completion of this plan means a reviewed design artifact only. Completion of P0 requires W0-W4 and C01-C18 evidence; P1 remains disabled until W5/C19-C20 also pass. This document grants no production operation or data-sharing authorization.
+Cortex-side completion covers W1-W2: controlled storage/search/lifecycle, binding and installed-wheel tests. Full Bot P0 still requires host-owned W3-W4 and real-PG C14-C18 evidence. C19-C20/P1 remain disabled. See the public API contract for caller responsibilities; this code does not grant production-operation or data-sharing authorization.

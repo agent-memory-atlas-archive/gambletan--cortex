@@ -4,9 +4,9 @@ build-backend = "maturin"
 
 [project]
 name = "cortex-ai-memory"
-version = "2.4.0"
+version = "2.5.0"
 description = "Private. Free. Local. — Memory engine for personal AI agents."
-requires-python = ">=3.9"
+requires-python = ">=3.9,<3.14"
 license = "MIT"
 authors = [
     { name = "Alvin Tang" }

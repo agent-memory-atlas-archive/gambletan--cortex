@@ -2,6 +2,7 @@ pub mod belief;
 pub mod compression;
 pub mod consolidation;
 pub mod context;
+pub mod controlled;
 pub mod embedder;
 pub mod episode;
 pub mod events;

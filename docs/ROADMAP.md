@@ -8,13 +8,15 @@ zero telemetry, cryptographically hardened, defense-in-depth.
 This is the prioritized forward plan. The per-iteration security audits
 (`SECURITY_AUDIT_ITER_*.md`) are the historical record; this is where we're going next.
 
-### Bot memory integration proposal (2026-10-22)
+### Bot memory integration (2026-10-22)
 
 [Implementation plan](design/bot-memory-integration.md): reuse Cortex as an optional,
 controlled retrieval index behind the Bot MemoryManager. PostgreSQL keeps memory and
 permission authority; existing personal Cortex behavior remains compatible. W0-W4 cover
-the first retrieval delivery; inference/tidy is a separate W5 enhancement. Design only:
-no implementation, release, or deployment, and no change to the shipped status below.
+the full retrieval delivery; Cortex W1/W2 are implemented on the integration branch,
+while Bot/Studio W3/W4 remain caller-owned. See the [API contract](controlled-memory-api.md).
+Inference/tidy is a separate disabled W5 enhancement. No package publication or Bot
+deployment is claimed, and the historical shipped status below is unchanged.
 
 ---
 

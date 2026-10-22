@@ -613,6 +613,7 @@ dependencies = [
  "half",
  "hmac",
  "instant-distance",
+ "libc",
  "lru",
  "notify",
  "parking_lot",
@@ -678,10 +679,13 @@ dependencies = [
 
 [[package]]
 name = "cortex-python"
-version = "2.4.0"
+version = "2.5.0"
 dependencies = [
  "cortex-core",
+ "parking_lot",
  "pyo3",
+ "serde",
+ "serde_json",
  "uuid",
 ]
 
