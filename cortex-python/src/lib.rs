@@ -17,11 +17,21 @@ struct PyCortex {
 impl PyCortex {
     /// Open or create a Cortex database.
     #[new]
-    fn new(db_path: &str) -> PyResult<Self> {
-        let inner = Cortex::open(db_path).map_err(to_py_err)?;
+    fn new(py: Python<'_>, db_path: &str) -> PyResult<Self> {
+        let inner = py
+            .allow_threads(|| Cortex::open(db_path))
+            .map_err(to_py_err)?;
         Ok(Self { inner })
     }
 
+    fn cleanup_pending(&self, py: Python<'_>) -> PyResult<bool> {
+        py.allow_threads(|| self.inner.cleanup_pending())
+            .map_err(to_py_err)
+    }
+    fn retry_cleanup(&self, py: Python<'_>) -> PyResult<bool> {
+        py.allow_threads(|| self.inner.retry_cleanup())
+            .map_err(to_py_err)
+    }
     /// Ingest a new memory from any channel.
     #[pyo3(signature = (text, channel, user_id=None, salience=None, embedding=None))]
     fn ingest(
@@ -202,15 +212,15 @@ fn bounded_value(
         ));
     }
     if value.is_exact_instance_of::<PyInt>() {
-        return Ok(serde_json::Value::from(
-            value.extract::<i64>().map_err(|_| invalid())?,
-        ));
+        let number = value.extract::<i64>().map_err(|_| invalid())?;
+        debit(budget, number.to_string().len())?;
+        return Ok(serde_json::Value::from(number));
     }
     if value.is_exact_instance_of::<PyFloat>() {
         let number = value.extract::<f64>().map_err(|_| invalid())?;
-        return serde_json::Number::from_f64(number)
-            .map(serde_json::Value::Number)
-            .ok_or_else(invalid);
+        let number = serde_json::Number::from_f64(number).ok_or_else(invalid)?;
+        debit(budget, number.to_string().len())?;
+        return Ok(serde_json::Value::Number(number));
     }
     if value.is_exact_instance_of::<PyString>() {
         let string = value.downcast::<PyString>().map_err(|_| invalid())?;
@@ -312,6 +322,28 @@ struct PyControlledStore {
     creator_pid: u32,
     inner: parking_lot::Mutex<Option<std::sync::Arc<cortex_core::controlled::ControlledStore>>>,
 }
+impl Drop for PyControlledStore {
+    fn drop(&mut self) {
+        let handle = self.inner.get_mut().take();
+        if self.creator_pid != std::process::id() {
+            // Never touch copied SQLite/mutex state during child finalization.
+            std::mem::forget(handle);
+            return;
+        }
+        if let Some(handle) = handle {
+            // PyO3 invokes pyclass destruction with an attached Python thread;
+            // with_gil reuses that attachment even during interpreter teardown.
+            // Native destruction performs no Python work while detached.
+            Python::with_gil(|py| {
+                py.allow_threads(move || {
+                    let _ = handle.close();
+                    drop(handle);
+                })
+            });
+        }
+    }
+}
+
 impl PyControlledStore {
     fn check_process(&self, py: Python<'_>) -> PyResult<()> {
         if self.creator_pid != std::process::id() {

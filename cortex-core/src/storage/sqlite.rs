@@ -10,6 +10,11 @@ use rusqlite::{params, Connection, OptionalExtension};
 use std::sync::Arc;
 use uuid::Uuid;
 
+// SQLite/native state may have copied mutexes after fork. Only exec/spawn may
+// initialize a fresh process once any store has initialized this library.
+#[cfg(unix)]
+static SQLITE_PROCESS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
 /// Number of read-only connections in the pool.
 const READ_POOL_SIZE: usize = 4;
 
@@ -41,6 +46,16 @@ enum DbKey<'a> {
 }
 
 impl SqliteStorage {
+    #[cfg(not(unix))]
+    pub(crate) fn guard_open_process() -> bool { true }
+    #[cfg(unix)]
+    pub(crate) fn guard_open_process() -> bool {
+        use std::sync::atomic::Ordering;
+        let pid = std::process::id();
+        match SQLITE_PROCESS.compare_exchange(0, pid, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => true, Err(owner) => owner == pid,
+        }
+    }
     fn apply_read_pragmas(conn: &Connection) -> Result<(), CortexError> {
         conn.execute_batch(
             "PRAGMA cache_size=-64000;
@@ -145,65 +160,82 @@ impl SqliteStorage {
     /// must be owner-only. Creates a new file as 0600 — SQLite gives `-wal`/`-shm` the
     /// main file's mode — and tightens files left group/world-readable by older releases.
     #[cfg(unix)]
-    fn restrict_db_file_mode(path: &str) -> Result<(), CortexError> {
-        use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
-        if path == ":memory:" {
-            return Ok(());
-        }
-        // URI filenames have aliases and query parameters; accepting them here
-        // would let SQLite open a different file than the descriptor we secure.
-        if path.is_empty() || path.starts_with("file:") {
-            return Err(CortexError::InvalidInput(
-                "use a filesystem path or :memory:".into(),
-            ));
-        }
-        let main = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(path)
-            .map_err(|e| CortexError::Storage(e.to_string()))?;
-        for suffix in ["", "-wal", "-shm", "-journal"] {
-            let file = if suffix.is_empty() {
-                main.try_clone()
-            } else {
-                match std::fs::OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .custom_flags(libc::O_NOFOLLOW)
-                    .open(format!("{path}{suffix}"))
-                {
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-                    other => other,
-                }
+    fn trusted_directory_chain(path: &std::path::Path, allow_trusted_symlinks: bool) -> Result<(), CortexError> {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let mut prefix = std::path::PathBuf::new();
+        for component in path.components() {
+            prefix.push(component);
+            let link = std::fs::symlink_metadata(&prefix).map_err(|e| CortexError::Storage(e.to_string()))?;
+            let uid = unsafe { libc::geteuid() };
+            if link.uid() != 0 && link.uid() != uid {
+                return Err(CortexError::InvalidInput("untrusted database ancestor".into()));
             }
-            .map_err(|e| CortexError::Storage(e.to_string()))?;
-            let meta = file
-                .metadata()
-                .map_err(|e| CortexError::Storage(e.to_string()))?;
-            if !meta.is_file() || meta.uid() != unsafe { libc::geteuid() } || meta.nlink() != 1 {
-                return Err(CortexError::Storage(
-                    "database must be an owner-owned regular file".into(),
-                ));
-            }
-            file.set_permissions(std::fs::Permissions::from_mode(0o600))
-                .map_err(|e| CortexError::Storage(e.to_string()))?;
-            if file
-                .metadata()
-                .map_err(|e| CortexError::Storage(e.to_string()))?
-                .permissions()
-                .mode()
-                & 0o777
-                != 0o600
-            {
-                return Err(CortexError::Storage(
-                    "database permissions are not private".into(),
-                ));
+            let meta = if link.file_type().is_symlink() {
+                if !allow_trusted_symlinks { return Err(CortexError::InvalidInput("symlink database ancestor".into())); }
+                std::fs::metadata(&prefix).map_err(|e| CortexError::Storage(e.to_string()))?
+            } else { link };
+            if !meta.is_dir() || (meta.uid() != 0 && meta.uid() != uid)
+                || (meta.permissions().mode() & 0o022 != 0 && meta.permissions().mode() & 0o1000 == 0) {
+                return Err(CortexError::InvalidInput("untrusted database ancestor".into()));
             }
         }
         Ok(())
+    }
+    #[cfg(unix)]
+    fn restrict_db_file_mode(path: &str) -> Result<String, CortexError> {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if path == ":memory:" { return Ok(path.to_owned()); }
+        if path.is_empty() || path.starts_with("file:") {
+            return Err(CortexError::InvalidInput("use a filesystem path or :memory:".into()));
+        }
+        let absolute = std::env::current_dir().map_err(|e| CortexError::Storage(e.to_string()))?.join(path);
+        let parent = absolute.parent().ok_or_else(|| CortexError::InvalidInput("database parent".into()))?;
+        // Check aliases before canonicalization, then the resolved ancestry too.
+        // Only this user/root can change these directory entries. Sticky parents
+        // protect already-owned files; atomic no-clobber publication handles new names.
+        Self::trusted_directory_chain(parent, true)?;
+        let parent = parent.canonicalize().map_err(|e| CortexError::Storage(e.to_string()))?;
+        Self::trusted_directory_chain(&parent, false)?;
+        // Sticky shared ancestors are allowed, but the immediate directory must
+        // prevent other UIDs from racing creation of predictable WAL/SHM names.
+        if std::fs::metadata(&parent).map_err(|e| CortexError::Storage(e.to_string()))?.permissions().mode() & 0o022 != 0 {
+            return Err(CortexError::InvalidInput("database parent must not be shared-writable".into()));
+        }
+        let resolved = parent.join(absolute.file_name().ok_or_else(|| CortexError::InvalidInput("database filename".into()))?);
+        if matches!(std::fs::symlink_metadata(&resolved), Err(e) if e.kind() == std::io::ErrorKind::NotFound) {
+            // Close the new 0600 temporary descriptor BEFORE publishing its name.
+            // Never open/close existing SQLite artifacts outside its VFS: closing
+            // an unrelated -shm FD releases the process's active POSIX WAL locks.
+            let temporary = tempfile::Builder::new().prefix(".cortex-private-").tempfile_in(&parent)
+                .map_err(|e| CortexError::Storage(e.to_string()))?.into_temp_path();
+            if let Err(error) = temporary.persist_noclobber(&resolved) {
+                if error.error.kind() != std::io::ErrorKind::AlreadyExists {
+                    return Err(CortexError::Storage(error.error.to_string()));
+                }
+            }
+        }
+        for suffix in ["", "-wal", "-shm", "-journal"] {
+            let artifact = if suffix.is_empty() { resolved.clone() } else {
+                let mut name = resolved.as_os_str().to_os_string(); name.push(suffix); std::path::PathBuf::from(name)
+            };
+            let before = match std::fs::symlink_metadata(&artifact) {
+                Err(e) if !suffix.is_empty() && e.kind() == std::io::ErrorKind::NotFound => continue,
+                other => other.map_err(|e| CortexError::Storage(e.to_string()))?,
+            };
+            if !before.is_file() || before.uid() != unsafe { libc::geteuid() } || before.nlink() != 1 {
+                return Err(CortexError::Storage("database must be an owner-owned regular file".into()));
+            }
+            // Safe under the verified, non-replaceable directory chain and the
+            // file's verified owner. No unrelated descriptors are opened/closed.
+            std::fs::set_permissions(&artifact, std::fs::Permissions::from_mode(0o600))
+                .map_err(|e| CortexError::Storage(e.to_string()))?;
+            let after = std::fs::symlink_metadata(&artifact).map_err(|e| CortexError::Storage(e.to_string()))?;
+            if !after.is_file() || before.dev() != after.dev() || before.ino() != after.ino()
+                || before.uid() != after.uid() || after.nlink() != 1 || after.permissions().mode() & 0o777 != 0o600 {
+                return Err(CortexError::Storage("database file changed or is not private".into()));
+            }
+        }
+        resolved.to_str().map(str::to_owned).ok_or_else(|| CortexError::InvalidInput("database path encoding".into()))
     }
 
     fn open_keyed(path: &str, key: Option<DbKey>, readers: usize) -> Result<Self, CortexError> {
@@ -221,14 +253,14 @@ impl SqliteStorage {
                 DROP TRIGGER IF EXISTS memories_fts_ad;
                 DROP TRIGGER IF EXISTS memories_fts_au;
                 CREATE TRIGGER memories_fts_ai AFTER INSERT ON memories BEGIN
-                  INSERT INTO memories_fts(rowid,id,content) VALUES(NEW.rowid,NEW.id,NEW.content_json); END;
+                  INSERT INTO memories_fts(rowid,id,content) VALUES(NEW.rowid,NEW.id,json_extract(NEW.content_json,'$.Text')); END;
                 CREATE TRIGGER memories_fts_ad AFTER DELETE ON memories BEGIN
                   DELETE FROM memories_fts WHERE rowid=OLD.rowid; END;
                 CREATE TRIGGER memories_fts_au AFTER UPDATE OF content_json ON memories BEGIN
                   DELETE FROM memories_fts WHERE rowid=OLD.rowid;
-                  INSERT INTO memories_fts(rowid,id,content) VALUES(NEW.rowid,NEW.id,NEW.content_json); END;
+                  INSERT INTO memories_fts(rowid,id,content) VALUES(NEW.rowid,NEW.id,json_extract(NEW.content_json,'$.Text')); END;
                 DELETE FROM memories_fts;
-                INSERT INTO memories_fts(rowid,id,content) SELECT rowid,id,content_json FROM memories;
+                INSERT INTO memories_fts(rowid,id,content) SELECT rowid,id,json_extract(content_json,'$.Text') FROM memories;
                 COMMIT;")
                 .map_err(|e| CortexError::Storage(e.to_string()))
         })?;
@@ -241,8 +273,13 @@ impl SqliteStorage {
         readers: usize,
         controlled: bool,
     ) -> Result<Self, CortexError> {
+        if !Self::guard_open_process() {
+            return Err(CortexError::InvalidInput("use spawn/exec after fork".into()));
+        }
         #[cfg(unix)]
-        Self::restrict_db_file_mode(path)?;
+        let private_path = Self::restrict_db_file_mode(path)?;
+        #[cfg(unix)]
+        let path = private_path.as_str();
         let conn = Connection::open(path).map_err(|e| CortexError::Storage(e.to_string()))?;
         Self::apply_key(&conn, key.as_ref())?;
 
@@ -300,6 +337,27 @@ impl SqliteStorage {
         )
         .map_err(|e| CortexError::Storage(e.to_string()))?;
 
+        let had_memories: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='memories')", [], |r| r.get(0))
+            .map_err(|e| CortexError::Storage(e.to_string()))?;
+        let mut storage = Self {
+            write_conn: Mutex::new(conn),
+            read_pool: Vec::new(),
+            mem_cache: Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MEM_CACHE_SIZE).unwrap(),
+            )),
+            entity_cache: Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(ENTITY_CACHE_SIZE).unwrap(),
+            )),
+        };
+        storage.init()?;
+        // Enable scrubbing of subsequent FTS changes; historical content is handled
+        // by the checked erasure migration below. FTS5 otherwise keeps deleted terms
+        // until a merge (secure_delete only scrubs freed b-tree pages). Needs SQLite
+        // 3.42+; on older builds scrub_after_delete falls back to an index rebuild.
+        let _ = storage.write_conn.lock().execute_batch(
+            "INSERT INTO memories_fts(memories_fts, rank) VALUES('secure-delete', 1);",
+        );
+        storage.initialize_privacy_maintenance(had_memories)?;
         // Open read-only connections for concurrent reads
         let mut read_pool = Vec::with_capacity(readers);
         for _ in 0..readers {
@@ -315,30 +373,68 @@ impl SqliteStorage {
             read_pool.push(Mutex::new(reader));
         }
 
-        let storage = Self {
-            write_conn: Mutex::new(conn),
-            read_pool,
-            mem_cache: Mutex::new(lru::LruCache::new(
-                std::num::NonZeroUsize::new(MEM_CACHE_SIZE).unwrap(),
-            )),
-            entity_cache: Mutex::new(lru::LruCache::new(
-                std::num::NonZeroUsize::new(ENTITY_CACHE_SIZE).unwrap(),
-            )),
-        };
-        storage.init()?;
-        // Deletes are permanent: FTS5 otherwise keeps deleted terms in index segments
-        // until a merge (secure_delete only scrubs freed b-tree pages). Needs SQLite
-        // 3.42+; on older builds scrub_after_delete falls back to an index rebuild.
-        let _ = storage.write_conn.lock().execute_batch(
-            "INSERT INTO memories_fts(memories_fts, rank) VALUES('secure-delete', 1);",
-        );
+        storage.read_pool = read_pool;
         Ok(storage)
+    }
+
+    fn initialize_privacy_maintenance(&self, had_memories: bool) -> Result<(), CortexError> {
+        let conn = self.write_conn.lock();
+        conn.execute_batch("CREATE TABLE IF NOT EXISTS cortex_privacy_maintenance(id INTEGER PRIMARY KEY CHECK(id=1), erasure_version INTEGER NOT NULL, cleanup_pending INTEGER NOT NULL);")
+            .map_err(|e| CortexError::Storage(e.to_string()))?;
+        conn.execute("INSERT OR IGNORE INTO cortex_privacy_maintenance(id,erasure_version,cleanup_pending) VALUES(1,?1,?2)", params![if had_memories { 0 } else { 1 }, had_memories])
+            .map_err(|e| CortexError::Storage(e.to_string()))?;
+        // Version zero is itself pending even if a previous process crashed.
+        let pending = Self::retry_personal_cleanup_on_connection(&conn)?;
+        let version: i64 = conn.query_row("SELECT erasure_version FROM cortex_privacy_maintenance WHERE id=1", [], |r| r.get(0)).map_err(|e| CortexError::Storage(e.to_string()))?;
+        if pending && version == 0 { return Err(CortexError::Storage("privacy upgrade pending; quiesce readers and reopen".into())); }
+        Ok(())
+    }
+    /// Logical deletion and physical file cleanup are separate outcomes.
+    /// True persists across restart until a successful bounded cleanup retry.
+    pub fn cleanup_pending(&self) -> Result<bool, CortexError> {
+        let conn = self.write_conn.lock();
+        conn.query_row("SELECT cleanup_pending OR erasure_version=0 FROM cortex_privacy_maintenance WHERE id=1", [], |r| r.get(0))
+            .map_err(|e| CortexError::Storage(e.to_string()))
+    }
+    /// Retry pending cleanup. Returns true while work remains. A reader can block
+    /// completion; close it and retry. No files/receipts are deleted to hide failure.
+    pub fn retry_cleanup(&self) -> Result<bool, CortexError> {
+        Self::retry_personal_cleanup_on_connection(&self.write_conn.lock())
+    }
+    fn retry_personal_cleanup_on_connection(conn: &Connection) -> Result<bool, CortexError> {
+        let (version, pending): (i64,bool) = conn.query_row("SELECT erasure_version,cleanup_pending FROM cortex_privacy_maintenance WHERE id=1", [], |r| Ok((r.get(0)?,r.get(1)?)))
+            .map_err(|e| CortexError::Storage(e.to_string()))?;
+        if version != 0 && !pending { return Ok(false); }
+        if version == 0 {
+            // Hold SQLite's exclusive locking mode across the multi-step migration,
+            // including VACUUM (which cannot run in an explicit transaction).
+            // This excludes old binaries/writers between rebuild and checkpoint.
+            let migrated = (|| -> rusqlite::Result<bool> {
+                conn.execute_batch("PRAGMA locking_mode=EXCLUSIVE; BEGIN EXCLUSIVE;
+                    INSERT INTO memories_fts(memories_fts) VALUES('rebuild'); COMMIT;
+                    VACUUM;")?;
+                if !Self::scrub_after_delete(conn) { return Ok(false); }
+                conn.execute("UPDATE cortex_privacy_maintenance SET erasure_version=1,cleanup_pending=0 WHERE id=1", [])?;
+                Ok(true)
+            })();
+            // Restore normal sharing even after an interrupted migration attempt.
+            if !conn.is_autocommit() { let _ = conn.execute_batch("ROLLBACK;"); }
+            conn.execute_batch("PRAGMA locking_mode=NORMAL; PRAGMA schema_version;")
+                .map_err(|e| CortexError::Storage(e.to_string()))?;
+            return migrated.map(|done| !done).map_err(|e| CortexError::Storage(e.to_string()));
+        }
+        if Self::scrub_after_delete(conn) {
+            conn.execute("UPDATE cortex_privacy_maintenance SET cleanup_pending=0 WHERE id=1", [])
+                .map_err(|e| CortexError::Storage(e.to_string()))?;
+            return Ok(false);
+        }
+        Ok(true)
     }
 
     /// Make a committed delete permanent on disk: purge the deleted terms from the FTS
     /// index, then fold the WAL back into the (zero-scrubbed) database and truncate it so
-    /// the plaintext does not linger in old WAL frames. Best effort: a reader holding a
-    /// snapshot can block the checkpoint; the next delete or autocheckpoint retries.
+    /// the plaintext does not linger in old WAL frames. A reader holding a snapshot
+    /// can block completion; callers persist pending state and expose explicit retry.
     pub(crate) fn scrub_after_delete(conn: &Connection) -> bool {
         // A snapshot reader can block truncation indefinitely. Cleanup is bounded;
         // controlled callers persist and expose a retryable pending flag.
@@ -372,6 +468,7 @@ impl SqliteStorage {
     }
 
     pub fn open_in_memory() -> Result<Self, CortexError> {
+        if !Self::guard_open_process() { return Err(CortexError::InvalidInput("use spawn/exec after fork".into())); }
         let conn = Connection::open_in_memory().map_err(|e| CortexError::Storage(e.to_string()))?;
         conn.execute_batch("PRAGMA foreign_keys=ON;")
             .map_err(|e| CortexError::Storage(e.to_string()))?;
@@ -387,6 +484,7 @@ impl SqliteStorage {
             )),
         };
         storage.init()?;
+        storage.initialize_privacy_maintenance(false)?;
         Ok(storage)
     }
 
@@ -986,17 +1084,16 @@ impl StorageBackend for SqliteStorage {
 
     fn delete_memory(&self, id: Uuid) -> Result<(), CortexError> {
         let conn = self.write_conn.lock();
-        let id_str = id.to_string();
-        let mut stmt = conn
-            .prepare_cached("DELETE FROM memories WHERE id = ?1")
-            .map_err(|e| CortexError::Storage(e.to_string()))?;
-        stmt.execute(params![id_str])
-            .map_err(|e| CortexError::Storage(e.to_string()))?;
-        drop(stmt);
-
-        // FTS5 synced via trigger (memories_fts_ad)
-        Self::scrub_after_delete(&conn);
+        let tx = conn.unchecked_transaction().map_err(|e| CortexError::Storage(e.to_string()))?;
+        tx.execute("DELETE FROM memories WHERE id=?1", [id.to_string()]).map_err(|e| CortexError::Storage(e.to_string()))?;
+        tx.execute("UPDATE cortex_privacy_maintenance SET cleanup_pending=1 WHERE id=1", []).map_err(|e| CortexError::Storage(e.to_string()))?;
+        tx.commit().map_err(|e| CortexError::Storage(e.to_string()))?;
         self.cache_evict(&id);
+        // Logical deletion is committed. Preserve its success and expose physical
+        // failure durably through cleanup_pending()/retry_cleanup().
+        if Self::retry_personal_cleanup_on_connection(&conn).is_err() {
+            tracing::warn!("SQLite physical cleanup remains pending after logical deletion");
+        }
         Ok(())
     }
 
@@ -1881,11 +1978,10 @@ impl StorageBackend for SqliteStorage {
         }
         // FTS5 synced via trigger (memories_fts_ad)
 
+        conn.execute("UPDATE cortex_privacy_maintenance SET cleanup_pending=1 WHERE id=1", []).map_err(|e| CortexError::Storage(e.to_string()))?;
         conn.execute_batch("COMMIT;")
             .map_err(|e| CortexError::Storage(e.to_string()))?;
-        if count > 0 {
-            Self::scrub_after_delete(&conn);
-        }
+        if count > 0 && Self::retry_personal_cleanup_on_connection(&conn).is_err() { tracing::warn!("SQLite physical cleanup remains pending after logical deletion"); }
         // Evict deleted entries from cache
         {
             let mut cache = self.mem_cache.lock();

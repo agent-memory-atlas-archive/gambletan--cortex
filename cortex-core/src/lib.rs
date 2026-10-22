@@ -1569,7 +1569,8 @@ impl Cortex {
         &mut self.working
     }
 
-    /// Delete a memory permanently.
+    /// Logically delete a memory and record retryable physical cleanup.
+    /// Check cleanup_pending()/retry_cleanup() before claiming local erasure.
     pub fn delete_memory(&self, id: Uuid) -> Result<(), CortexError> {
         self.storage.delete_memory(id)?;
         self.index.remove(&id);
@@ -1603,6 +1604,12 @@ impl Cortex {
     pub fn flush_durable(&self) -> Result<(), CortexError> {
         self.storage.flush_durable()
     }
+
+    /// Whether physical SQLite cleanup remains after logical deletion/upgrade.
+    pub fn cleanup_pending(&self) -> Result<bool, CortexError> { self.storage.cleanup_pending() }
+
+    /// Retry physical cleanup; true means a reader or maintenance work still blocks it.
+    pub fn retry_cleanup(&self) -> Result<bool, CortexError> { self.storage.retry_cleanup() }
 
     /// The database file, or `None` for an in-memory instance.
     pub fn db_path(&self) -> Option<std::path::PathBuf> {

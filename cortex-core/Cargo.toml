@@ -50,3 +50,4 @@ harness = false
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+tempfile = "3"

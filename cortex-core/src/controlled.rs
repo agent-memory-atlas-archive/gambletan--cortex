@@ -14,7 +14,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::path::{Component, Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
@@ -168,11 +168,63 @@ impl Default for SearchOptions {
     }
 }
 
+static OPEN_REPLICAS: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+struct ReplicaLease {
+    path: PathBuf,
+    pid: u32,
+}
+impl ReplicaLease {
+    fn acquire(path: &Path) -> Result<Self> {
+        // guard_open_process has already rejected fork children before this mutex.
+        let mut open = OPEN_REPLICAS
+            .get_or_init(|| Mutex::new(HashSet::new()))
+            .lock();
+        if !open.insert(path.to_owned()) {
+            return Err(ControlledError::Busy);
+        }
+        Ok(Self {
+            path: path.to_owned(),
+            pid: std::process::id(),
+        })
+    }
+}
+impl Drop for ReplicaLease {
+    fn drop(&mut self) {
+        if self.pid == std::process::id() {
+            if let Some(open) = OPEN_REPLICAS.get() {
+                open.lock().remove(&self.path);
+            }
+        }
+    }
+}
+#[cfg(unix)]
+fn lock_replica(file: &File) -> Result<()> {
+    use std::os::fd::AsRawFd;
+    // POSIX process-owned record locks are not inherited through fork. In-process
+    // exclusion happens before opening this inode, so no duplicate FD close can
+    // silently release our lock. SQLite uses a different inode for its own locks.
+    let mut lock: libc::flock = unsafe { std::mem::zeroed() };
+    lock.l_type = libc::F_WRLCK as _;
+    lock.l_whence = libc::SEEK_SET as _;
+    if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETLK, &lock) } == -1 {
+        return match std::io::Error::last_os_error().raw_os_error() {
+            Some(libc::EAGAIN) | Some(libc::EACCES) => Err(ControlledError::Busy),
+            _ => Err(ControlledError::Storage),
+        };
+    }
+    Ok(())
+}
+#[cfg(not(unix))]
+fn lock_replica(_: &File) -> Result<()> {
+    Err(ControlledError::InvalidInput("Unix required"))
+}
+
 struct State {
     storage: Option<SqliteStorage>,
     ready: bool,
     closed: bool,
     file: Option<File>,
+    lease: Option<ReplicaLease>,
 }
 impl State {
     fn storage(&self) -> Result<&SqliteStorage> {
@@ -277,7 +329,7 @@ fn private_file(path: &Path) -> Result<File> {
         .create(true)
         .truncate(false)
         .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)
         .map_err(|_| ControlledError::InvalidInput("unsafe store file"))?;
     let m = f.metadata().map_err(|_| ControlledError::Storage)?;
@@ -295,6 +347,52 @@ fn private_file(_: &Path) -> Result<File> {
     ))
 }
 
+fn prepare_root(root: &Path, before_create: impl Fn(&Path)) -> Result<()> {
+    let mut prefix = PathBuf::new();
+    for component in root.components() {
+        prefix.push(component);
+        match std::fs::symlink_metadata(&prefix) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                before_create(&prefix);
+                let mut builder = std::fs::DirBuilder::new();
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::DirBuilderExt;
+                    builder.mode(0o700);
+                }
+                // One component at a time. mkdir never follows a precreated final
+                // symlink; after EEXIST we validate the actual entry, not its target.
+                match builder.create(&prefix) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(_) => return Err(ControlledError::Storage),
+                }
+            }
+            Err(_) => return Err(ControlledError::Storage),
+            Ok(_) => {}
+        }
+        let meta = std::fs::symlink_metadata(&prefix).map_err(|_| ControlledError::Storage)?;
+        if !meta.is_dir() {
+            return Err(ControlledError::InvalidInput("unsafe root entry"));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+            let uid = unsafe { libc::geteuid() };
+            let mode = meta.permissions().mode();
+            if (meta.uid() != 0 && meta.uid() != uid)
+                || (mode & 0o022 != 0 && mode & 0o1000 == 0)
+                || (prefix == root && (meta.uid() != uid || mode & 0o077 != 0))
+            {
+                return Err(ControlledError::InvalidInput(
+                    "untrusted or nonprivate root",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn effective(p: &Projection, now: DateTime<Utc>) -> bool {
     p.valid_from.is_none_or(|t| t <= now) && p.valid_until.is_none_or(|t| now < t)
 }
@@ -307,12 +405,18 @@ impl Drop for ControlledStore {
             if let Some(storage) = s.storage.take() {
                 std::mem::forget(storage);
             }
+            if let Some(file) = s.file.take() {
+                std::mem::forget(file);
+            }
         }
     }
 }
 
 impl ControlledStore {
     pub fn open(root: &Path, identity: StoreIdentity) -> Result<Self> {
+        if !SqliteStorage::guard_open_process() {
+            return Err(ControlledError::Conflict("use spawn/exec after fork"));
+        }
         for x in [
             &identity.owner_type,
             &identity.owner_id,
@@ -326,46 +430,14 @@ impl ControlledStore {
                 "absolute private root required",
             ));
         }
-        let mut prefix = PathBuf::new();
-        for c in root.components() {
-            prefix.push(c);
-            if let Ok(m) = std::fs::symlink_metadata(&prefix) {
-                if m.file_type().is_symlink() {
-                    return Err(ControlledError::InvalidInput("symlink root"));
-                }
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::{MetadataExt, PermissionsExt};
-                    let uid = unsafe { libc::geteuid() };
-                    let mode = m.permissions().mode();
-                    // An untrusted ancestor owner or writable non-sticky parent
-                    // could replace the private root between validation and open.
-                    if (m.uid() != 0 && m.uid() != uid) || (mode & 0o022 != 0 && mode & 0o1000 == 0)
-                    {
-                        return Err(ControlledError::InvalidInput("untrusted root ancestor"));
-                    }
-                }
-            }
-        }
-        let mut builder = std::fs::DirBuilder::new();
-        builder.recursive(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::DirBuilderExt;
-            builder.mode(0o700);
-        }
-        builder.create(root).map_err(|_| ControlledError::Storage)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::{MetadataExt, PermissionsExt};
-            let m = std::fs::metadata(root).map_err(|_| ControlledError::Storage)?;
-            if m.uid() != unsafe { libc::geteuid() } || m.permissions().mode() & 0o077 != 0 {
-                return Err(ControlledError::InvalidInput("root must be owner-only"));
-            }
-        }
-        let path = root.join(format!("{}.db", digest(&identity)?));
+        prepare_root(root, |_| {})?;
+        let path = root
+            .canonicalize()
+            .map_err(|_| ControlledError::Storage)?
+            .join(format!("{}.db", digest(&identity)?));
+        let lease = ReplicaLease::acquire(&path)?;
         let file = private_file(&path.with_extension("lock"))?;
-        file.try_lock().map_err(|_| ControlledError::Busy)?;
+        lock_replica(&file)?;
         for suffix in ["", "-wal", "-shm", "-journal"] {
             let p = PathBuf::from(format!("{}{suffix}", path.display()));
             if suffix.is_empty() || p.exists() || std::fs::symlink_metadata(&p).is_ok() {
@@ -393,6 +465,7 @@ impl ControlledStore {
                 ready: false,
                 closed: false,
                 file: Some(file),
+                lease: Some(lease),
             }),
             identity,
             creator_pid: std::process::id(),
@@ -474,6 +547,7 @@ impl ControlledStore {
         // no old Arc can retain SQLite or the OS lock after close returns.
         drop(s.storage.take());
         drop(s.file.take());
+        drop(s.lease.take());
         Ok(())
     }
     pub fn reconcile(&self, generation: &str, position: i64) -> Result<Status> {
@@ -1143,5 +1217,270 @@ mod tests {
             .iter()
             .all(|r| matches!(r, Err(ControlledError::InvalidInput(_)))));
         assert_eq!(std::fs::read_dir(&target).unwrap().count(), 0);
+    }
+    #[cfg(unix)]
+    #[test]
+    fn missing_root_cannot_follow_symlink_inserted_under_sticky_parent() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        let sticky = base.join("sticky");
+        std::fs::create_dir(&sticky).unwrap();
+        std::fs::set_permissions(&sticky, std::fs::Permissions::from_mode(0o1777)).unwrap();
+        let target = base.join("outside");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let root = sticky.join("initially-missing");
+        let result = prepare_root(&root, |prefix| {
+            assert_eq!(prefix, root);
+            std::os::unix::fs::symlink(&target, prefix).unwrap();
+        });
+        assert_eq!(result.unwrap_err().code(), "invalid_input");
+        assert_eq!(std::fs::read_dir(&target).unwrap().count(), 0);
+    }
+    #[test]
+    fn writer_probe_child() {
+        let Ok(path) = std::env::var("CORTEX_WRITER_PROBE_PATH") else {
+            return;
+        };
+        let busy_expected = std::env::var("CORTEX_WRITER_PROBE_BUSY").unwrap() == "1";
+        let conn = rusqlite::Connection::open(path).unwrap();
+        conn.busy_timeout(Duration::from_millis(100)).unwrap();
+        let result = conn.execute_batch("BEGIN IMMEDIATE; ROLLBACK;");
+        if busy_expected {
+            match result {
+                Err(rusqlite::Error::SqliteFailure(error, _)) => assert!(matches!(
+                    error.code,
+                    rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+                )),
+                other => panic!("active writer lock was lost: {other:?}"),
+            }
+        } else {
+            result.unwrap();
+        }
+    }
+    fn probe_writer(path: &Path, busy: bool) {
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "controlled::tests::writer_probe_child",
+                "--exact",
+                "--nocapture",
+            ])
+            .env("CORTEX_WRITER_PROBE_PATH", path)
+            .env("CORTEX_WRITER_PROBE_BUSY", if busy { "1" } else { "0" })
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while child.try_wait().unwrap().is_none() {
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("writer probe timed out");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "writer probe failed: {} {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    #[test]
+    fn opening_personal_or_rejecting_controlled_does_not_release_live_wal_locks() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        let personal_path = base.join("personal.db");
+        let personal = SqliteStorage::open(personal_path.to_str().unwrap()).unwrap();
+        personal
+            .with_controlled_conn(|conn| -> Result<()> {
+                conn.execute_batch("BEGIN IMMEDIATE;")?;
+                probe_writer(&personal_path, true);
+                let second = SqliteStorage::open(personal_path.to_str().unwrap());
+                probe_writer(&personal_path, true);
+                conn.execute_batch("ROLLBACK;")?;
+                drop(second);
+                Ok(())
+            })
+            .unwrap();
+        probe_writer(&personal_path, false);
+        let controlled = ControlledStore::open(&base.join("private"), identity()).unwrap();
+        let state = controlled.state.lock();
+        let storage = state.storage().unwrap();
+        let path = storage.db_path().unwrap();
+        storage
+            .with_controlled_conn(|conn| -> Result<()> {
+                conn.execute_batch("BEGIN IMMEDIATE;")?;
+                probe_writer(&path, true);
+                assert!(SqliteStorage::open(path.to_str().unwrap()).is_err());
+                probe_writer(&path, true);
+                conn.execute_batch("ROLLBACK;")?;
+                Ok(())
+            })
+            .unwrap();
+        probe_writer(&path, false);
+    }
+    #[test]
+    fn old_personal_history_is_scrubbed_by_checked_upgrade() {
+        use crate::storage::traits::StorageBackend;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().canonicalize().unwrap().join("legacy.db");
+        let storage = SqliteStorage::open(path.to_str().unwrap()).unwrap();
+        let marker = "ZQXLEGACYPRIVATEHISTORY";
+        let old = MemObjectBuilder::new(
+            MemoryTier::Episodic,
+            MemContent::Text((marker.to_owned() + " ").repeat(2000)),
+            MemSource::new("legacy"),
+        )
+        .build();
+        storage.store_memory(&old).unwrap();
+        drop(storage);
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch("PRAGMA secure_delete=OFF;").unwrap();
+        let _ = conn.execute_batch(
+            "INSERT INTO memories_fts(memories_fts,rank) VALUES('secure-delete',0);",
+        );
+        conn.execute_batch("DROP TABLE cortex_privacy_maintenance;")
+            .unwrap();
+        assert_eq!(
+            conn.query_row("PRAGMA secure_delete", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        conn.execute(
+            "UPDATE memories SET content_json=?1 WHERE id=?2",
+            params![
+                json(&MemContent::Text((marker.to_owned() + " ").repeat(2000))).unwrap(),
+                old.id.to_string()
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE memories SET content_json=?1 WHERE id=?2",
+            params![
+                json(&MemContent::Text("current replacement".into())).unwrap(),
+                old.id.to_string()
+            ],
+        )
+        .unwrap();
+        conn.execute("DELETE FROM memories WHERE id=?1", [old.id.to_string()])
+            .unwrap();
+        drop(conn);
+        let contains = |path: &Path| {
+            std::fs::read(path)
+                .unwrap_or_default()
+                .windows(marker.len())
+                .any(|w| w.eq_ignore_ascii_case(marker.as_bytes()))
+        };
+        assert!(
+            contains(&path),
+            "fixture must retain real legacy plaintext before upgrade"
+        );
+        let upgraded = SqliteStorage::open(path.to_str().unwrap()).unwrap();
+        assert!(!upgraded.cleanup_pending().unwrap());
+        assert!(!contains(&path));
+        assert!(!contains(&PathBuf::from(format!("{}-wal", path.display()))));
+    }
+    #[test]
+    fn reader_probe_child() {
+        let Ok(path) = std::env::var("CORTEX_READER_PROBE_PATH") else {
+            return;
+        };
+        let marker = std::env::var("CORTEX_READER_PROBE_MARKER").unwrap();
+        let conn =
+            rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .unwrap();
+        conn.execute_batch("BEGIN;").unwrap();
+        conn.query_row("SELECT COUNT(*) FROM memories", [], |r| r.get::<_, i64>(0))
+            .unwrap();
+        std::fs::write(marker, "ready").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        panic!("reader probe parent did not terminate child");
+    }
+    #[test]
+    fn legacy_logical_delete_tracks_blocked_physical_cleanup_and_retries() {
+        use crate::storage::traits::StorageBackend;
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        let path = base.join("personal.db");
+        let cortex = crate::Cortex::open(path.to_str().unwrap()).unwrap();
+        let memory = cortex
+            .ingest(
+                "ZQXREADBLOCKPRIVATE local private record",
+                "test",
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        let marker = base.join("reader-ready");
+        struct Child(std::process::Child);
+        impl Drop for Child {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let child = Child(
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "controlled::tests::reader_probe_child",
+                    "--exact",
+                    "--nocapture",
+                ])
+                .env("CORTEX_READER_PROBE_PATH", &path)
+                .env("CORTEX_READER_PROBE_MARKER", &marker)
+                .stdout(std::process::Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while !marker.exists() {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        cortex.delete_memory(memory.id).unwrap();
+        assert!(cortex.storage.get_memory(memory.id).unwrap().is_none());
+        assert!(cortex.cleanup_pending().unwrap());
+        assert!(cortex.retry_cleanup().unwrap());
+        drop(child);
+        assert!(!cortex.retry_cleanup().unwrap());
+        drop(cortex);
+        let reopened = crate::Cortex::open(path.to_str().unwrap()).unwrap();
+        assert!(!reopened.cleanup_pending().unwrap());
+    }
+    #[test]
+    fn interrupted_privacy_upgrade_never_marks_completion_and_can_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().canonicalize().unwrap().join("upgrade.db");
+        let storage = SqliteStorage::open(path.to_str().unwrap()).unwrap();
+        storage.with_controlled_conn(|conn| -> Result<()> {
+            conn.execute_batch("UPDATE cortex_privacy_maintenance SET erasure_version=0,cleanup_pending=1;
+                CREATE TRIGGER fail_erasure_completion BEFORE UPDATE ON cortex_privacy_maintenance
+                WHEN NEW.erasure_version=1 BEGIN SELECT RAISE(ABORT,'injected completion failure'); END;")?; Ok(())
+        }).unwrap();
+        drop(storage);
+        assert!(SqliteStorage::open(path.to_str().unwrap()).is_err());
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let (version, pending): (i64, bool) = conn
+            .query_row(
+                "SELECT erasure_version,cleanup_pending FROM cortex_privacy_maintenance WHERE id=1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(version, 0);
+        assert!(pending);
+        conn.execute_batch("DROP TRIGGER fail_erasure_completion;")
+            .unwrap();
+        drop(conn);
+        let reopened = SqliteStorage::open(path.to_str().unwrap()).unwrap();
+        assert!(!reopened.cleanup_pending().unwrap());
     }
 }

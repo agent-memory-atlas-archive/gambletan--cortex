@@ -718,6 +718,213 @@ s.close()
             self.assertEqual(result["degraded"], baseline["degraded"])
             self.assertEqual(result["truncated"], baseline["truncated"])
 
+    def test_personal_fifo_is_rejected_without_blocking(self):
+        fifo = Path(self.temp.name).resolve() / "not-a-database.db"
+        os.mkfifo(fifo, 0o600)
+        script = r'''
+import sys
+from cortex_ai_memory import Cortex
+try:
+    instance = Cortex(sys.argv[1])
+except RuntimeError:
+    print('refused', flush=True)
+else:
+    raise AssertionError('personal Cortex accepted FIFO')
+'''
+        begin = time.monotonic()
+        completed = subprocess.run([sys.executable, "-I", "-c", script, str(fifo)],
+                                   capture_output=True, text=True, timeout=4.0)
+        self.assertLess(time.monotonic() - begin, 5.0)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(completed.stdout.strip(), "refused")
+        self.assertTrue(fifo.is_fifo())
+
+    def test_personal_owned_file_under_unsafe_ancestor_is_refused(self):
+        ancestor = Path(self.temp.name).resolve() / "personal-unsafe-parent"
+        ancestor.mkdir(mode=0o700)
+        database = ancestor / "personal.db"
+        database.write_bytes(b"")
+        database.chmod(0o600)
+        self.assertEqual(database.stat().st_uid, os.geteuid())
+        before = (database.stat().st_mode, database.read_bytes())
+        ancestor.chmod(0o777)
+        try:
+            with self.assertRaises(RuntimeError):
+                instance = memory.Cortex(str(database))
+                del instance
+                gc.collect()
+            self.assertEqual((database.stat().st_mode, database.read_bytes()), before)
+            self.assertEqual({path.name for path in ancestor.iterdir()}, {"personal.db"})
+        finally:
+            ancestor.chmod(0o700)
+
+    def test_aggregate_numeric_input_budget_is_atomic(self):
+        store = self.ready()
+        vector = [1.234567890123456e-100] * 4096
+        oversized = [upsert(projection("numeric-budget-%d" % i, embedding=vector))
+                     for i in range(100)]
+        self.assertGreater(len(json.dumps(oversized).encode("utf-8")), 8*1024*1024,
+                           "fixture must exceed aggregate JSON budget")
+        self.error("invalid_input", store.apply_batch, oversized, 101)
+        self.assertEqual(store.status()["position"], 100)
+        self.assertEqual(self.hits(store), [])
+        receipt = store.upsert(projection("legitimate-vector", embedding=vector), 101)
+        self.assertTrue(receipt["durable"])
+        self.assertEqual(self.hits(store)[0]["memory_id"], "legitimate-vector")
+
+    def test_sticky_parent_precreated_final_symlink_cannot_escape(self):
+        base = Path(self.temp.name).resolve()
+        sticky = base / "shared-sticky"
+        outside = base / "outside-root"
+        sticky.mkdir(mode=0o700)
+        sticky.chmod(0o1777)
+        outside.mkdir(mode=0o700)
+        sentinel = outside / "sentinel"
+        sentinel.write_bytes(b"unchanged external fixture")
+        root = sticky / "controlled-root"
+        root.symlink_to(outside, target_is_directory=True)
+        before = (outside.stat().st_mode, sentinel.stat().st_mode, sentinel.read_bytes())
+        try:
+            self.error("invalid_input", self.open, root=str(root))
+            self.assertTrue(root.is_symlink())
+            self.assertEqual({path.name for path in outside.iterdir()}, {"sentinel"})
+            self.assertEqual((outside.stat().st_mode, sentinel.stat().st_mode, sentinel.read_bytes()), before)
+        finally:
+            sticky.chmod(0o700)
+
+    def test_fork_child_liveness_does_not_retain_parent_replica_lock(self):
+        script = r'''
+import json, os, signal, subprocess, sys
+from cortex_ai_memory import ControlledStore, ControlledError
+root = sys.argv[1]
+s = ControlledStore(root, 'merchant', 'merchant-acceptance', 'bot-one', 'replica-one')
+s.finish_snapshot(100)
+r, w = os.pipe()
+release_r, release_w = os.pipe()
+pid = os.fork()
+if pid == 0:
+    signal.alarm(10)
+    os.close(r); os.close(release_w)
+    codes = []
+    for call in (s.status, lambda: ControlledStore(root, 'merchant', 'merchant-acceptance', 'bot-one', 'fork-new')):
+        try:
+            call(); codes.append('unexpected-success')
+        except ControlledError as error:
+            codes.append(error.code)
+    os.write(w, (json.dumps(codes)+'\n').encode())
+    os.close(w)
+    os.read(release_r, 1)
+    os._exit(0)
+os.close(w); os.close(release_r)
+try:
+    codes = json.loads(os.fdopen(r).readline())
+    assert codes == ['conflict', 'conflict'], codes
+    s.close()
+    reopened = ControlledStore(root, 'merchant', 'merchant-acceptance', 'bot-one', 'replica-one')
+    assert os.waitpid(pid, os.WNOHANG) == (0, 0), 'child must remain alive during reopen'
+    reopened.close()
+    fresh = "from cortex_ai_memory import ControlledStore; import sys; s=ControlledStore(sys.argv[1], 'merchant', 'merchant-acceptance', 'bot-one', 'spawn-new'); s.close(); print('fresh-opened')"
+    spawned = subprocess.run([sys.executable, '-I', '-c', fresh, root], capture_output=True, text=True, timeout=5)
+    assert spawned.returncode == 0, spawned.stderr
+    assert spawned.stdout.strip() == 'fresh-opened'
+    print(json.dumps({'inherited': codes, 'parent_reopened': True, 'fresh_spawn': True}), flush=True)
+finally:
+    os.write(release_w, b'x'); os.close(release_w)
+    os.waitpid(pid, 0)
+'''
+        completed = subprocess.run([sys.executable, "-I", "-c", script, self.root],
+                                   capture_output=True, text=True, timeout=15)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(json.loads(completed.stdout),
+                         {"inherited": ["conflict", "conflict"], "parent_reopened": True, "fresh_spawn": True})
+
+    def test_last_reference_teardown_heartbeat_and_normal_shutdown(self):
+        script = r'''
+import gc, json, pathlib, subprocess, sys, threading, time
+from cortex_ai_memory import ControlledStore
+root, mode = sys.argv[1:]
+s = ControlledStore(root, 'merchant', 'merchant-acceptance', 'bot-one', 'replica-one')
+sc = {'kind':'owner','id':'merchant-acceptance'}
+items = [{'memory_id':'drop-%d'%i,'revision':1,'scope':sc,'kind':'fact',
+          'text':'orchid '+('x'*11990),'source_refs':[{'kind':'input','provider':'test','id':'drop'}]} for i in range(100)]
+s.seed(items); s.finish_snapshot(100); s.reconcile(s.status()['generation'],100)
+if mode == 'shutdown':
+    print('live-store-at-shutdown', flush=True)
+else:
+    db = next(p for p in pathlib.Path(root).rglob('*.db') if p.read_bytes()[:16] == b'SQLite format 3\x00')
+    reader_code = "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]+'?mode=ro',uri=True); c.execute('BEGIN'); c.execute('SELECT count(*) FROM sqlite_master').fetchone(); print('ready',flush=True); sys.stdin.readline(); c.close()"
+    reader = subprocess.Popen([sys.executable,'-I','-c',reader_code,db.as_uri()],stdin=subprocess.PIPE,stdout=subprocess.PIPE,text=True)
+    try:
+        assert reader.stdout.readline().strip() == 'ready'
+        for item in items:
+            item['revision'] = 2
+            item['text'] = 'orchid replacement '+('y'*11980)
+        s.apply_batch([{'op':'upsert','projection':p} for p in items],101)
+        assert s.status()['cleanup_pending']
+        stop = threading.Event(); started = threading.Event(); ticks = []
+        def beat():
+            started.set()
+            while not stop.is_set():
+                ticks.append(time.monotonic()); time.sleep(0.0002)
+        thread = threading.Thread(target=beat); thread.start(); started.wait()
+        previous = sys.getswitchinterval()
+        try:
+            sys.setswitchinterval(10)
+            begin = time.monotonic(); del s; gc.collect(); end = time.monotonic()
+        finally:
+            sys.setswitchinterval(previous); stop.set(); thread.join(timeout=2)
+        assert end-begin < 5, ('unbounded destructor',end-begin)
+        progress = sum(begin < tick < end for tick in ticks)
+        if end-begin >= 0.005:
+            assert progress > 0, ('GIL blocked through substantial teardown',end-begin)
+        reopened = ControlledStore(root,'merchant','merchant-acceptance','bot-one','replica-one')
+        reopened.close()
+        print(json.dumps({'elapsed':end-begin,'heartbeat_ticks':progress,'reopened':True}),flush=True)
+    finally:
+        reader.communicate(input='release\n',timeout=5)
+'''
+        for mode in ("drop", "shutdown"):
+            with self.subTest(mode=mode):
+                root = str((Path(self.temp.name) / mode).resolve())
+                completed = subprocess.run([sys.executable, "-I", "-c", script, root, mode],
+                                           capture_output=True, text=True, timeout=15)
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+                if mode == "drop":
+                    self.assertTrue(json.loads(completed.stdout)["reopened"])
+                    print("last-reference teardown metrics: " + completed.stdout.strip(), flush=True)
+                else:
+                    self.assertEqual(completed.stdout.strip(), "live-store-at-shutdown")
+                reopened = self.open(root=root)
+                self.reconcile(reopened)
+                self.assertEqual(len(self.hits(reopened, limit=100)), 100)
+                reopened.close()
+
+    def test_lexical_matching_uses_decoded_text_not_serialization(self):
+        scores = []
+        for index, text in enumerate(("alpha orchid", "alpha\norchid", "alpha\torchid", "alpha\\orchid")):
+            store = self.ready([projection(text=text, embedding=[1.0, 0.0])], replica="decoded-%d" % index)
+            def score(query):
+                hits = store.search(query, [SCOPE], limit=1, max_candidates=1, embedding=[1.0, 0.0])["hits"]
+                self.assertEqual(len(hits), 1)
+                return hits[0]["score"]
+            actual = score("orchid")
+            unrelated = score("nonexistentlexicalword")
+            self.assertGreater(actual, unrelated)
+            self.assertEqual(score("Text"), unrelated,
+                             "serialized Text label must not boost unrelated text")
+            self.assertEqual(score("norchid"), unrelated,
+                             "newline escape must not create phantom word")
+            self.assertEqual(score("torchid"), unrelated,
+                             "tab escape must not create phantom word")
+            scores.append(actual)
+        for value in scores[1:]:
+            self.assertAlmostEqual(value, scores[0], places=6)
+        actual_label = self.ready([projection(text="Text orchid", embedding=[1.0, 0.0])], replica="actual-label")
+        match = actual_label.search("Text", [SCOPE], limit=1, max_candidates=1, embedding=[1.0, 0.0])["hits"][0]
+        unrelated = actual_label.search("nonexistentlexicalword", [SCOPE], limit=1, max_candidates=1,
+                                      embedding=[1.0, 0.0])["hits"][0]
+        self.assertGreater(match["score"], unrelated["score"])
+
     def test_restored_local_transaction_loss_rejects_remote_cursor(self):
         store = self.ready([projection()])
         state = store.status()
