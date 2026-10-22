@@ -1320,6 +1320,32 @@ mod tests {
         probe_writer(&path, false);
     }
     #[test]
+    fn simultaneous_public_openers_claim_exactly_one_database_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap().join("private");
+        prepare_root(&root, |_| {}).unwrap();
+        let path = root.join(format!("{}.db", digest(&identity()).unwrap()));
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let other_barrier = barrier.clone();
+        let other_path = path.clone();
+        let personal = std::thread::spawn(move || {
+            other_barrier.wait();
+            SqliteStorage::open(other_path.to_str().unwrap())
+        });
+        barrier.wait();
+        let controlled = ControlledStore::open(&root, identity());
+        let personal = personal.join().unwrap();
+        assert_ne!(
+            controlled.is_ok(),
+            personal.is_ok(),
+            "exactly one public mode may initialize"
+        );
+        drop(controlled);
+        drop(personal);
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE name IN ('cortex_controlled_marker','cortex_personal_marker')",[],|r|r.get::<_,i64>(0)).unwrap(),1);
+    }
+    #[test]
     fn rejecting_personal_file_at_controlled_path_preserves_its_writer_lock() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap().join("private");

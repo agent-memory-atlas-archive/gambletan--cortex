@@ -291,6 +291,42 @@ impl SqliteStorage {
         Ok(storage)
     }
 
+    fn admit_database_mode(conn: &Connection, controlled: bool, after_classification: impl FnOnce()) -> Result<(), CortexError> {
+        // Claim the mode before any schema initialization. Both openers must use
+        // this same transaction; merely inspecting a marker permits mode races.
+        let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)
+            .map_err(|e| CortexError::Storage(e.to_string()))?;
+        let exists = |name: &str| tx.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name=?1)", [name], |r| r.get::<_,bool>(0))
+            .map_err(|e| CortexError::Storage(e.to_string()));
+        let marked = exists("cortex_controlled_marker")?;
+        let personal = exists("cortex_personal_marker")?;
+        if (marked && personal) || (controlled && personal) || (!controlled && marked) {
+            return Err(CortexError::InvalidInput("database mode conflicts with requested API".into()));
+        }
+        let marker = if controlled { "cortex_controlled_marker" } else { "cortex_personal_marker" };
+        if marked || personal {
+            let marker_is_table: bool = tx.query_row("SELECT type='table' FROM sqlite_master WHERE name=?1", [marker], |r|r.get(0))
+                .map_err(|e| CortexError::Storage(e.to_string()))?;
+            if !marker_is_table { return Err(CortexError::InvalidInput("invalid database mode marker".into())); }
+            let sql = format!("SELECT COUNT(*),MIN(version),MAX(version) FROM {marker}");
+            let version: (i64,Option<i64>,Option<i64>) = tx.query_row(&sql, [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)))
+                .map_err(|e| CortexError::Storage(e.to_string()))?;
+            if version != (1,Some(1),Some(1)) { return Err(CortexError::InvalidInput("unsupported database mode format".into())); }
+        } else if controlled {
+            let nonempty: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name NOT GLOB 'sqlite_*')", [], |r|r.get(0))
+                .map_err(|e| CortexError::Storage(e.to_string()))?;
+            if nonempty { return Err(CortexError::InvalidInput("cannot import a personal database".into())); }
+        }
+        after_classification();
+        if !marked && !personal {
+            // The personal marker also reserves a fresh file across a crash or
+            // initialization failure, before memories/FTS have been created.
+            tx.execute_batch(&format!("CREATE TABLE {marker}(version INTEGER NOT NULL); INSERT INTO {marker} VALUES(1);"))
+                .map_err(|e| CortexError::Storage(e.to_string()))?;
+        }
+        tx.commit().map_err(|e| CortexError::Storage(e.to_string()))
+    }
+
     fn open_keyed_mode(
         path: &str,
         key: Option<DbKey>,
@@ -307,46 +343,7 @@ impl SqliteStorage {
         let conn = Connection::open(path).map_err(|e| CortexError::Storage(e.to_string()))?;
         Self::apply_key(&conn, key.as_ref())?;
 
-        let marked: bool = conn
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='cortex_controlled_marker')",
-                [],
-                |r| r.get(0),
-            )
-            .map_err(|e| CortexError::Storage(e.to_string()))?;
-        if marked && !controlled {
-            return Err(CortexError::InvalidInput(
-                "controlled database requires ControlledStore".into(),
-            ));
-        }
-        if controlled && !marked {
-            let nonempty: bool = conn
-                .query_row(
-                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name NOT LIKE 'sqlite_%')",
-                    [],
-                    |r| r.get(0),
-                )
-                .map_err(|e| CortexError::Storage(e.to_string()))?;
-            if nonempty {
-                return Err(CortexError::InvalidInput(
-                    "cannot import a personal database".into(),
-                ));
-            }
-            conn.execute_batch("BEGIN IMMEDIATE; CREATE TABLE cortex_controlled_marker(version INTEGER NOT NULL); INSERT INTO cortex_controlled_marker VALUES(1); COMMIT;")
-                .map_err(|e| CortexError::Storage(e.to_string()))?;
-        }
-        if controlled {
-            let version: i64 = conn
-                .query_row("SELECT version FROM cortex_controlled_marker", [], |r| {
-                    r.get(0)
-                })
-                .map_err(|e| CortexError::Storage(e.to_string()))?;
-            if version != 1 {
-                return Err(CortexError::InvalidInput(
-                    "unsupported controlled store format".into(),
-                ));
-            }
-        }
+        Self::admit_database_mode(&conn, controlled, || {})?;
 
         conn.execute_batch(
             "PRAGMA journal_mode=WAL;
@@ -2358,6 +2355,50 @@ mod privacy_cleanup_tests {
         assert!(!second.cleanup_pending().unwrap());
         assert!(!contains(&path));
         assert!(!contains(&std::path::PathBuf::from(format!("{}-wal",path.display()))));
+    }
+    fn assert_mode_admission_is_serialized(first_controlled: bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mode-race.db");
+        let first = Connection::open(&path).unwrap();
+        let second = Connection::open(&path).unwrap();
+        second.busy_timeout(std::time::Duration::ZERO).unwrap();
+        let mut second_admitted = false;
+        SqliteStorage::admit_database_mode(&first, first_controlled, || {
+            second_admitted = SqliteStorage::admit_database_mode(&second, !first_controlled, || {}).is_ok();
+            if second_admitted && first_controlled {
+                // A personal opener proceeds to initialize/populate before the
+                // paused controlled opener creates its marker.
+                second.execute_batch("CREATE TABLE personal_payload(text TEXT); INSERT INTO personal_payload VALUES('must not be imported');").unwrap();
+            }
+        }).unwrap();
+        assert!(!second_admitted,"both modes passed admission across classification");
+        assert!(SqliteStorage::admit_database_mode(&second, !first_controlled, || {}).is_err());
+    }
+    #[test]
+    fn personal_admission_blocks_a_competing_controlled_opener() { assert_mode_admission_is_serialized(false); }
+    #[test]
+    fn controlled_admission_blocks_a_competing_personal_opener() { assert_mode_admission_is_serialized(true); }
+    #[test]
+    fn mode_admission_rejects_user_objects_with_sqlite_like_names_and_fake_markers() {
+        for definition in ["CREATE TABLE sqlitex_payload(text TEXT)","CREATE VIEW sqlitex_view AS SELECT 1 AS version", "CREATE VIEW cortex_controlled_marker AS SELECT 1 AS version"] {
+            let conn=Connection::open_in_memory().unwrap();conn.execute_batch(definition).unwrap();
+            assert!(SqliteStorage::admit_database_mode(&conn,true,||{}).is_err());
+        }
+    }
+    #[test]
+    fn admission_reservation_survives_initialization_failure_and_rejects_conflicting_markers() {
+        for controlled in [false,true] {
+            let dir=tempfile::tempdir().unwrap();let path=dir.path().join("reserved.db");
+            let conn=Connection::open(&path).unwrap();
+            SqliteStorage::admit_database_mode(&conn,controlled,||{}).unwrap();drop(conn);
+            // Simulate process death before memories/FTS initialization.
+            let conn=Connection::open(&path).unwrap();
+            assert!(SqliteStorage::admit_database_mode(&conn,!controlled,||{}).is_err());
+            SqliteStorage::admit_database_mode(&conn,controlled,||{}).unwrap();
+            let other=if controlled {"cortex_personal_marker"}else{"cortex_controlled_marker"};
+            conn.execute_batch(&format!("CREATE TABLE {other}(version INTEGER NOT NULL);INSERT INTO {other} VALUES(1);")).unwrap();
+            for mode in [false,true] {assert!(SqliteStorage::admit_database_mode(&conn,mode,||{}).is_err());}
+        }
     }
     #[test]
     fn existing_maintenance_table_acquires_cleanup_tokens_on_reopen() {
