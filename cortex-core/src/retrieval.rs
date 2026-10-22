@@ -281,8 +281,22 @@ impl<'a> RetrievalEngine<'a> {
         // Batch fetch all candidates in a single query
         let all_ids: Vec<Uuid> = candidate_scores.keys().copied().collect();
         let memories = self.storage.get_memories_batch(&all_ids)?;
-        let mem_map: HashMap<Uuid, Arc<MemObject>> = memories.into_iter().map(|m| (m.id, Arc::new(m))).collect();
+        let mem_map: HashMap<Uuid, Arc<MemObject>> =
+            memories.into_iter().map(|m| (m.id, Arc::new(m))).collect();
 
+        self.rank_candidates(query, &candidate_scores, &mem_map, &fts_scores, None)
+    }
+
+    /// Shared ranking for candidates already constrained by a trusted scope predicate.
+    pub(crate) fn rank_candidates(
+        &self,
+        query: &RetrievalQuery,
+        candidate_scores: &HashMap<Uuid, f32>,
+        mem_map: &HashMap<Uuid, Arc<MemObject>>,
+        fts_scores: &HashMap<Uuid, f32>,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<Vec<RetrievalResult>, CortexError> {
+        let temporal_intent = detect_temporal_intent(&query.text);
         // Adapt weights for temporal queries
         let weights = match temporal_intent {
             TemporalIntent::None => self.weights.clone(),
@@ -343,7 +357,10 @@ impl<'a> RetrievalEngine<'a> {
 
         // Score each candidate
         let mut results = Vec::new();
-        for (&id, &sim_score) in &candidate_scores {
+        for (&id, &sim_score) in candidate_scores {
+            if deadline.is_some_and(|end| std::time::Instant::now() >= end) {
+                break;
+            }
             if let Some(mem) = mem_map.get(&id) {
                 // Namespace isolation: skip memories that don't match requested namespace
                 if let Some(ref ns) = query.namespace {
@@ -358,7 +375,8 @@ impl<'a> RetrievalEngine<'a> {
                 }
 
                 let fts_score = fts_scores.get(&id).copied().unwrap_or(0.0);
-                let breakdown = self.compute_scores(mem, sim_score, query, &temporal_intent, fts_score);
+                let breakdown =
+                    self.compute_scores(mem, sim_score, query, &temporal_intent, fts_score);
                 let final_score = weights.similarity * breakdown.similarity
                     + weights.temporal * breakdown.temporal
                     + weights.salience * breakdown.salience
@@ -424,7 +442,12 @@ impl<'a> RetrievalEngine<'a> {
                 if expanded.len() >= MAX_EXPANSION_TERMS {
                     break 'entities;
                 }
-                if let MemContent::Fact { subject, predicate, object } = &mem.content {
+                if let MemContent::Fact {
+                    subject,
+                    predicate,
+                    object,
+                } = &mem.content
+                {
                     let entity_lower = entity.to_lowercase();
                     if subject.to_lowercase().contains(&entity_lower) {
                         expanded.insert(object.clone());
@@ -465,7 +488,10 @@ impl<'a> RetrievalEngine<'a> {
     ) -> Result<Vec<(Uuid, f32)>, CortexError> {
         let terms: Vec<String> = entities.iter().cloned().collect();
         let matches = self.storage.search_episodic_by_terms(&terms, limit)?;
-        Ok(matches.into_iter().map(|(id, _text)| (id, 0.30_f32)).collect())
+        Ok(matches
+            .into_iter()
+            .map(|(id, _text)| (id, 0.30_f32))
+            .collect())
     }
 
     /// Multi-hop expansion: look at top initial candidates, extract entities
@@ -484,7 +510,9 @@ impl<'a> RetrievalEngine<'a> {
         let mut entities: Vec<String> = Vec::new();
         for mem in &top_mems {
             match &mem.content {
-                MemContent::Fact { subject, object, .. } => {
+                MemContent::Fact {
+                    subject, object, ..
+                } => {
                     if subject != "User" && !entities.contains(subject) {
                         entities.push(subject.clone());
                     }
@@ -492,7 +520,9 @@ impl<'a> RetrievalEngine<'a> {
                         entities.push(object.clone());
                     }
                 }
-                MemContent::Relationship { person_a, person_b, .. } => {
+                MemContent::Relationship {
+                    person_a, person_b, ..
+                } => {
                     // person_a/person_b are UUIDs, skip for now
                     let _ = (person_a, person_b);
                 }
@@ -526,10 +556,9 @@ impl<'a> RetrievalEngine<'a> {
         limit: usize,
     ) -> Result<Vec<MemObject>, CortexError> {
         match intent {
-            TemporalIntent::Recent => {
-                self.storage
-                    .list_by_tier_ordered_by_ingestion(MemoryTier::Episodic, limit)
-            }
+            TemporalIntent::Recent => self
+                .storage
+                .list_by_tier_ordered_by_ingestion(MemoryTier::Episodic, limit),
             TemporalIntent::First | TemporalIntent::Earliest => {
                 // Get all and reverse (oldest first)
                 let mut mems = self
@@ -595,10 +624,16 @@ impl<'a> RetrievalEngine<'a> {
             match &mem.source.identity_id {
                 Some(id) if *id == person_id => 1.0,
                 _ => match &mem.content {
-                    MemContent::Relationship { person_a, person_b, .. } => {
+                    MemContent::Relationship {
+                        person_a, person_b, ..
+                    } => {
                         let matches_a = *person_a == person_id;
                         let matches_b = *person_b == person_id;
-                        if matches_a | matches_b { 1.0 } else { 0.0 }
+                        if matches_a | matches_b {
+                            1.0
+                        } else {
+                            0.0
+                        }
                     }
                     _ => 0.0,
                 },
@@ -656,7 +691,13 @@ pub fn detect_query_type(query: &str) -> QueryType {
     }
 
     // Preference patterns (check before fact patterns since "what do I like" contains "what")
-    let pref_en = ["what do i like", "my preference", "do i prefer", "my favorite", "my favourite"];
+    let pref_en = [
+        "what do i like",
+        "my preference",
+        "do i prefer",
+        "my favorite",
+        "my favourite",
+    ];
     let pref_zh = ["我喜欢什么", "我的偏好", "我偏好", "我喜欢的"];
     for pat in &pref_en {
         if lower.contains(pat) {
@@ -670,7 +711,14 @@ pub fn detect_query_type(query: &str) -> QueryType {
     }
 
     // Person patterns
-    let person_en = ["who is", "who was", "who are", "about him", "about her", "about them"];
+    let person_en = [
+        "who is",
+        "who was",
+        "who are",
+        "about him",
+        "about her",
+        "about them",
+    ];
     for pat in &person_en {
         if lower.contains(pat) {
             return QueryType::PersonQuery;
@@ -681,10 +729,15 @@ pub fn detect_query_type(query: &str) -> QueryType {
         return QueryType::PersonQuery;
     }
     // "about [Name]" — look for "about" followed by a capitalized word
-    if let Some(pos) = lower.find("about ") {
-        let after = &query[pos + 6..];
-        if after.chars().next().is_some_and(|c| c.is_uppercase()) {
-            return QueryType::PersonQuery;
+    for (pos, _) in query.char_indices() {
+        if query[pos..]
+            .get(..6)
+            .is_some_and(|part| part.eq_ignore_ascii_case("about "))
+        {
+            let after = &query[pos + 6..];
+            if after.chars().next().is_some_and(|c| c.is_uppercase()) {
+                return QueryType::PersonQuery;
+            }
         }
     }
     // Chinese person patterns
@@ -703,7 +756,10 @@ pub fn detect_query_type(query: &str) -> QueryType {
             .take_while(|c| !c.is_whitespace() && !"的了吗呢吧？！，。".contains(*c))
             .collect();
         let char_count = name.chars().count();
-        let non_name_words = ["这个", "那个", "什么", "哪个", "一些", "所有", "我们", "他们", "项目", "问题", "情况", "事情"];
+        let non_name_words = [
+            "这个", "那个", "什么", "哪个", "一些", "所有", "我们", "他们", "项目", "问题", "情况",
+            "事情",
+        ];
         let is_non_name = non_name_words.iter().any(|w| name.contains(w));
         if (2..=4).contains(&char_count) && !is_non_name {
             return QueryType::PersonQuery;
@@ -765,9 +821,9 @@ fn extract_query_entities(text: &str) -> Vec<String> {
             let name = name_parts.join(" ");
             // Skip common English words that happen to start sentences
             let skip = [
-                "I", "The", "A", "An", "What", "Where", "When", "Who", "How",
-                "Tell", "Do", "Does", "Is", "Are", "Was", "Were", "Can", "Could",
-                "Will", "Would", "Should", "My", "Your", "His", "Her", "Their",
+                "I", "The", "A", "An", "What", "Where", "When", "Who", "How", "Tell", "Do", "Does",
+                "Is", "Are", "Was", "Were", "Can", "Could", "Will", "Would", "Should", "My",
+                "Your", "His", "Her", "Their",
             ];
             if !skip.contains(&name.as_str()) {
                 entities.push(name);
@@ -799,8 +855,10 @@ fn extract_query_entities(text: &str) -> Vec<String> {
     for word in lower.split_whitespace() {
         let clean: String = word.chars().filter(|c| c.is_alphanumeric()).collect();
         if clean.len() >= 4
-            && !["what", "where", "when", "about", "know", "tell", "does", "have"]
-                .contains(&clean.as_str())
+            && ![
+                "what", "where", "when", "about", "know", "tell", "does", "have",
+            ]
+            .contains(&clean.as_str())
             && !entities.iter().any(|e| e.to_lowercase() == clean)
         {
             entities.push(clean);
@@ -817,13 +875,31 @@ fn detect_temporal_intent(query: &str) -> TemporalIntent {
 
     // Recent intent
     let recent_en = [
-        "last time", "recently", "latest", "most recent", "just now",
-        "yesterday", "today", "this week", "last week", "this month",
-        "last month", "the other day",
+        "last time",
+        "recently",
+        "latest",
+        "most recent",
+        "just now",
+        "yesterday",
+        "today",
+        "this week",
+        "last week",
+        "this month",
+        "last month",
+        "the other day",
     ];
     let recent_zh = [
-        "最近", "上次", "昨天", "今天", "刚才", "这周", "上周",
-        "这个月", "上个月", "前几天", "最新",
+        "最近",
+        "上次",
+        "昨天",
+        "今天",
+        "刚才",
+        "这周",
+        "上周",
+        "这个月",
+        "上个月",
+        "前几天",
+        "最新",
     ];
 
     for pat in &recent_en {
@@ -839,12 +915,17 @@ fn detect_temporal_intent(query: &str) -> TemporalIntent {
 
     // First/earliest intent
     let first_en = [
-        "first time", "the first", "originally", "initially", "at first",
-        "when did", "earliest", "began", "started",
+        "first time",
+        "the first",
+        "originally",
+        "initially",
+        "at first",
+        "when did",
+        "earliest",
+        "began",
+        "started",
     ];
-    let first_zh = [
-        "第一次", "最初", "一开始", "起初", "最早", "什么时候开始",
-    ];
+    let first_zh = ["第一次", "最初", "一开始", "起初", "最早", "什么时候开始"];
 
     for pat in &first_en {
         if lower.contains(pat) {
@@ -859,13 +940,28 @@ fn detect_temporal_intent(query: &str) -> TemporalIntent {
 
     // Sequence intent (asking about order of events)
     let seq_en = [
-        "before", "after", "then", "followed by", "in order",
-        "timeline", "sequence", "chronolog", "when was", "what happened",
-        "how many times", "how often",
+        "before",
+        "after",
+        "then",
+        "followed by",
+        "in order",
+        "timeline",
+        "sequence",
+        "chronolog",
+        "when was",
+        "what happened",
+        "how many times",
+        "how often",
     ];
     let seq_zh = [
-        "之前", "之后", "然后", "顺序", "时间线", "多少次",
-        "什么时候", "先后",
+        "之前",
+        "之后",
+        "然后",
+        "顺序",
+        "时间线",
+        "多少次",
+        "什么时候",
+        "先后",
     ];
 
     for pat in &seq_en {
@@ -904,8 +1000,14 @@ mod tests {
         // A just-created, never-recalled memory: recency high, frequency zero → ~0.5.
         let fresh = TemporalInfo::now();
         let f = compute_frecency(&fresh, now);
-        assert!((0.0..=1.0).contains(&f), "frecency must stay in [0,1], got {f}");
-        assert!((0.45..=0.55).contains(&f), "fresh frecency should be ~0.5, got {f}");
+        assert!(
+            (0.0..=1.0).contains(&f),
+            "frecency must stay in [0,1], got {f}"
+        );
+        assert!(
+            (0.45..=0.55).contains(&f),
+            "fresh frecency should be ~0.5, got {f}"
+        );
     }
 
     #[test]
@@ -968,13 +1070,22 @@ mod tests {
     #[test]
     fn test_query_type_person_who() {
         assert_eq!(detect_query_type("Who is Alice?"), QueryType::PersonQuery);
-        assert_eq!(detect_query_type("who was that person?"), QueryType::PersonQuery);
+        assert_eq!(
+            detect_query_type("who was that person?"),
+            QueryType::PersonQuery
+        );
     }
 
     #[test]
     fn test_query_type_person_about_name() {
-        assert_eq!(detect_query_type("Tell me about Alice"), QueryType::PersonQuery);
-        assert_eq!(detect_query_type("What do you know about Bob Smith?"), QueryType::PersonQuery);
+        assert_eq!(
+            detect_query_type("Tell me about Alice"),
+            QueryType::PersonQuery
+        );
+        assert_eq!(
+            detect_query_type("What do you know about Bob Smith?"),
+            QueryType::PersonQuery
+        );
     }
 
     #[test]
@@ -982,14 +1093,20 @@ mod tests {
         assert_eq!(detect_query_type("谁是张三"), QueryType::PersonQuery);
         assert_eq!(detect_query_type("关于张三的信息"), QueryType::PersonQuery);
         // Non-name phrases after "关于" should NOT be PersonQuery
-        assert_ne!(detect_query_type("关于这个项目的进展"), QueryType::PersonQuery);
+        assert_ne!(
+            detect_query_type("关于这个项目的进展"),
+            QueryType::PersonQuery
+        );
         assert_ne!(detect_query_type("关于问题的解答"), QueryType::PersonQuery);
     }
 
     #[test]
     fn test_query_type_fact() {
         assert_eq!(detect_query_type("What is Rust?"), QueryType::FactQuery);
-        assert_eq!(detect_query_type("Where does Alice work?"), QueryType::FactQuery);
+        assert_eq!(
+            detect_query_type("Where does Alice work?"),
+            QueryType::FactQuery
+        );
         assert_eq!(detect_query_type("What does Bob do?"), QueryType::FactQuery);
     }
 
@@ -1001,51 +1118,85 @@ mod tests {
 
     #[test]
     fn test_query_type_preference() {
-        assert_eq!(detect_query_type("What do I like to eat?"), QueryType::PreferenceQuery);
-        assert_eq!(detect_query_type("What is my preference for editors?"), QueryType::PreferenceQuery);
+        assert_eq!(
+            detect_query_type("What do I like to eat?"),
+            QueryType::PreferenceQuery
+        );
+        assert_eq!(
+            detect_query_type("What is my preference for editors?"),
+            QueryType::PreferenceQuery
+        );
     }
 
     #[test]
     fn test_query_type_preference_chinese() {
-        assert_eq!(detect_query_type("我喜欢什么颜色"), QueryType::PreferenceQuery);
-        assert_eq!(detect_query_type("我的偏好是什么"), QueryType::PreferenceQuery);
+        assert_eq!(
+            detect_query_type("我喜欢什么颜色"),
+            QueryType::PreferenceQuery
+        );
+        assert_eq!(
+            detect_query_type("我的偏好是什么"),
+            QueryType::PreferenceQuery
+        );
     }
 
     #[test]
     fn test_query_type_temporal_defers() {
         // Temporal queries should be classified as Temporal, not other types
-        assert_eq!(detect_query_type("What did I do last time?"), QueryType::Temporal);
+        assert_eq!(
+            detect_query_type("What did I do last time?"),
+            QueryType::Temporal
+        );
         assert_eq!(detect_query_type("最近聊了什么"), QueryType::Temporal);
     }
 
     #[test]
     fn test_query_type_general() {
         assert_eq!(detect_query_type("hello there"), QueryType::General);
-        assert_eq!(detect_query_type("summarize everything"), QueryType::General);
+        assert_eq!(
+            detect_query_type("summarize everything"),
+            QueryType::General
+        );
     }
 
     #[test]
     fn test_extract_query_entities_english() {
         let entities = extract_query_entities("What do I know about Alice?");
-        assert!(entities.iter().any(|e| e == "Alice"), "Should extract Alice: {:?}", entities);
+        assert!(
+            entities.iter().any(|e| e == "Alice"),
+            "Should extract Alice: {:?}",
+            entities
+        );
     }
 
     #[test]
     fn test_extract_query_entities_full_name() {
         let entities = extract_query_entities("Tell me about Alice Smith");
-        assert!(entities.iter().any(|e| e == "Alice Smith"), "Should extract full name: {:?}", entities);
+        assert!(
+            entities.iter().any(|e| e == "Alice Smith"),
+            "Should extract full name: {:?}",
+            entities
+        );
     }
 
     #[test]
     fn test_extract_query_entities_chinese() {
         let entities = extract_query_entities("关于张三的信息");
-        assert!(entities.iter().any(|e| e == "张三"), "Should extract Chinese name: {:?}", entities);
+        assert!(
+            entities.iter().any(|e| e == "张三"),
+            "Should extract Chinese name: {:?}",
+            entities
+        );
     }
 
     #[test]
     fn test_extract_query_entities_skip_common() {
         let entities = extract_query_entities("What is the weather?");
         // "What" should be skipped
-        assert!(!entities.iter().any(|e| e == "What"), "Should skip common words: {:?}", entities);
+        assert!(
+            !entities.iter().any(|e| e == "What"),
+            "Should skip common words: {:?}",
+            entities
+        );
     }
 }

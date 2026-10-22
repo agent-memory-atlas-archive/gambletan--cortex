@@ -488,11 +488,22 @@ fn test_oplog_partial_line_recovery() {
         hmac: None,
     };
     let valid_line = serde_json::to_string(&op).unwrap();
-    std::fs::write(&file_path, format!("{}\n{{corrupt partial", valid_line)).unwrap();
+    let mut next=op.clone(); next.op_id=Uuid::new_v4();
+    let next_line=serde_json::to_string(&next).unwrap();
+    let split=next_line.len()/2;
+    std::fs::write(&file_path,format!("{}\n{}",valid_line,&next_line[..split])).unwrap();
 
-    let (ops, _) = oplog::read_oplog(&file_path, 0, None).unwrap();
+    let (ops, offset) = oplog::read_oplog(&file_path, 0, None).unwrap();
     assert_eq!(ops.len(), 1);
     assert_eq!(ops[0].op_id, op.op_id);
+    assert_eq!(offset, (valid_line.len()+1) as u64);
+    use std::io::Write;
+    let mut append=std::fs::OpenOptions::new().append(true).open(&file_path).unwrap();
+    writeln!(append,"{}",&next_line[split..]).unwrap();drop(append);
+    let (completed, final_offset)=oplog::read_oplog(&file_path,offset,None).unwrap();
+    assert_eq!(completed.len(),1);
+    assert_eq!(completed[0].op_id,next.op_id);
+    assert_eq!(final_offset,(valid_line.len()+next_line.len()+2) as u64);
 }
 
 #[test]
@@ -1097,8 +1108,13 @@ fn test_background_sync_detects_changes() {
     )
     .unwrap();
 
-    // Wait for debounce + processing time
-    std::thread::sleep(Duration::from_millis(1500));
+    // Native FSEvents may coalesce delivery for several seconds before our
+    // debounce even starts. Wait for the observable callback, retaining a bounded
+    // failure deadline rather than assuming a platform scheduling latency.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while call_count.load(Ordering::SeqCst) == 0 && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
 
     let count = call_count.load(Ordering::SeqCst);
     assert!(
@@ -1210,4 +1226,84 @@ fn test_manifest_without_hmac_is_rejected() {
         result.is_err(),
         "an encryption manifest with its HMAC stripped must be rejected (downgrade/tamper defense)"
     );
+}
+
+fn assert_oplog_restart_rotates_incomplete_tail(encrypted: bool) {
+    let tmp = TempDir::new().unwrap();
+    let sync_dir = tmp.path().join("sync");
+    let config = |device| {
+        let config = make_sync_config(&sync_dir, device);
+        if encrypted { config.with_encryption("test-only-restart-passphrase") } else { config }
+    };
+    let cortex_a = Cortex::in_memory().unwrap();
+    let make = |text: &str| {
+        let mut memory = MemObjectBuilder::new(MemoryTier::Episodic, MemContent::Text(text.into()), MemSource::new("test")).build();
+        memory.privacy = PrivacyLevel::Shared { scope: "all".into() };
+        memory
+    };
+    let first = make("complete before torn append");
+    let torn = make("crash truncated record");
+    let next = make("first acknowledged operation after restart");
+    let mut writer = SyncEngine::new(config("restart-device"),cortex_a.sqlite_storage()).unwrap();
+    writer.record_op(SyncPayload::MemoryUpsert { memory: first.clone() }).unwrap();
+    writer.record_op(SyncPayload::MemoryUpsert { memory: torn.clone() }).unwrap();
+    drop(writer);
+    let old = oplog::list_oplog_files(&sync_dir.join("devices/restart-device")).unwrap().remove(0);
+    let length = std::fs::metadata(&old).unwrap().len();
+    std::fs::OpenOptions::new().write(true).open(&old).unwrap().set_len(length-7).unwrap();
+    let mut restarted = SyncEngine::new(config("restart-device"),cortex_a.sqlite_storage()).unwrap();
+    restarted.record_op(SyncPayload::MemoryUpsert { memory: next.clone() }).unwrap();
+    drop(restarted);
+    assert_eq!(std::fs::metadata(&old).unwrap().len(),length-7,"torn history must be preserved");
+    let cortex_b = Cortex::in_memory().unwrap();
+    let mut receiver = SyncEngine::new(config("receiver"),cortex_b.sqlite_storage()).unwrap();
+    assert_eq!(receiver.pull_remote(cortex_b.sqlite_storage(),cortex_b.index()).unwrap(),2);
+    for memory in [&first,&next] {
+        assert_eq!(serde_json::to_value(cortex_b.storage().get_memory(memory.id).unwrap().unwrap().content).unwrap(),serde_json::to_value(&memory.content).unwrap());
+    }
+    assert!(cortex_b.storage().get_memory(torn.id).unwrap().is_none());
+    assert_eq!(receiver.pull_remote(cortex_b.sqlite_storage(),cortex_b.index()).unwrap(),0);
+    drop(receiver);
+    let mut receiver = SyncEngine::new(config("receiver"),cortex_b.sqlite_storage()).unwrap();
+    assert_eq!(receiver.pull_remote(cortex_b.sqlite_storage(),cortex_b.index()).unwrap(),0);
+}
+
+#[test]
+fn test_oplog_restart_after_plaintext_partial_append() { assert_oplog_restart_rotates_incomplete_tail(false); }
+#[test]
+fn test_oplog_restart_after_encrypted_partial_append() { assert_oplog_restart_rotates_incomplete_tail(true); }
+
+#[test]
+fn test_oplog_restart_after_torn_utf8_character() {
+    let tmp = TempDir::new().unwrap();
+    let sync_dir = tmp.path().join("utf8-sync");
+    let cortex_a = Cortex::in_memory().unwrap();
+    let mut engine = SyncEngine::new(make_sync_config(&sync_dir,"utf8-writer"),cortex_a.sqlite_storage()).unwrap();
+    let make = |text: &str| {
+        let mut m = MemObjectBuilder::new(MemoryTier::Episodic, MemContent::Text(text.into()), MemSource::new("test")).build();
+        m.privacy = PrivacyLevel::Shared { scope: "all".into() };m
+    };
+    let first=make("complete before UTF8 tail");let torn=make("before 猫 after");let next=make("next acknowledged record");
+    engine.record_op(SyncPayload::MemoryUpsert {memory:first.clone()}).unwrap();
+    let old=oplog::list_oplog_files(&sync_dir.join("devices/utf8-writer")).unwrap().remove(0);
+    let complete_offset=std::fs::metadata(&old).unwrap().len();
+    engine.record_op(SyncPayload::MemoryUpsert {memory:torn.clone()}).unwrap();drop(engine);
+    let bytes=std::fs::read(&old).unwrap();let cut=bytes.windows("猫".len()).position(|w|w=="猫".as_bytes()).unwrap()+1;
+    std::fs::OpenOptions::new().write(true).open(&old).unwrap().set_len(cut as u64).unwrap();
+    let (recovered,offset)=oplog::read_oplog(&old,0,None).unwrap();assert_eq!(recovered.len(),1);assert_eq!(offset,complete_offset);
+    let mut engine=SyncEngine::new(make_sync_config(&sync_dir,"utf8-writer"),cortex_a.sqlite_storage()).unwrap();
+    engine.record_op(SyncPayload::MemoryUpsert {memory:next.clone()}).unwrap();drop(engine);
+    let cortex_b=Cortex::in_memory().unwrap();let mut receiver=SyncEngine::new(make_sync_config(&sync_dir,"utf8-reader"),cortex_b.sqlite_storage()).unwrap();
+    assert_eq!(receiver.pull_remote(cortex_b.sqlite_storage(),cortex_b.index()).unwrap(),2);
+    assert!(cortex_b.storage().get_memory(first.id).unwrap().is_some());assert!(cortex_b.storage().get_memory(next.id).unwrap().is_some());assert!(cortex_b.storage().get_memory(torn.id).unwrap().is_none());
+    assert_eq!(receiver.pull_remote(cortex_b.sqlite_storage(),cortex_b.index()).unwrap(),0);
+    assert_eq!(oplog::read_oplog(&old,complete_offset,None).unwrap().1,complete_offset);
+}
+
+#[test]
+fn test_oplog_completed_invalid_utf8_is_rejected_without_blocking_later_records() {
+    let tmp=TempDir::new().unwrap();let path=tmp.path().join("corrupt.jsonl");
+    let make=||SyncOp {op_id:Uuid::new_v4(),hlc:HlcTimestamp::new(1000,0,"d"),payload:SyncPayload::MemoryDelete {id:Uuid::new_v4()},hmac:None};
+    let first=make();let next=make();let mut bytes=serde_json::to_vec(&first).unwrap();bytes.extend_from_slice(b"\n\xff\n");bytes.extend_from_slice(&serde_json::to_vec(&next).unwrap());bytes.push(b'\n');std::fs::write(&path,&bytes).unwrap();
+    let (ops,cursor)=oplog::read_oplog(&path,0,None).unwrap();assert_eq!(ops.len(),2);assert_eq!(ops[0].op_id,first.op_id);assert_eq!(ops[1].op_id,next.op_id);assert_eq!(cursor,bytes.len() as u64);
 }

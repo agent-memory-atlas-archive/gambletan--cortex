@@ -2,6 +2,13 @@
 
 Cortex provides persistent, local-first memory for AI agents. This guide shows how to integrate Cortex with popular multi-agent frameworks.
 
+For hosted Bots that already own memory and permissions in PostgreSQL, follow the
+[controlled Bot integration architecture and plan](../design/bot-memory-integration.md).
+That path uses Cortex only as a derived retrieval backend, with mandatory authoritative
+scope/version/withdrawal checks. The [ControlledStore API](../controlled-memory-api.md)
+defines the implemented Cortex-side contract; the host adapter remains the caller's
+responsibility. The personal-agent examples below do not provide hosted isolation.
+
 **What Cortex adds to any framework:**
 
 - **Persistent memory** -- 4-tier (Working / Episodic / Semantic / Procedural) that survives across sessions
@@ -44,10 +51,13 @@ pip install crewai cortex-ai-memory
 
 ```python
 from crewai import Agent, Task, Crew
-from cortex_ai_memory import PyCortex
+from cortex_ai_memory import Cortex
+from pathlib import Path
 
 # Initialize Cortex (creates or opens a local SQLite database)
-cx = PyCortex("~/.cortex/crewai.db")
+memory_dir = Path.home() / ".cortex"
+memory_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+cx = Cortex(str(memory_dir / "crewai.db"))
 
 
 def cortex_recall(query: str) -> str:
@@ -117,9 +127,12 @@ cx.add_preference("report_style", "concise with bullet points", 0.9)
 ### Storing Facts and Beliefs Between Runs
 
 ```python
-from cortex_ai_memory import PyCortex
+from cortex_ai_memory import Cortex
+from pathlib import Path
 
-cx = PyCortex("~/.cortex/crewai.db")
+memory_dir = Path.home() / ".cortex"
+memory_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+cx = Cortex(str(memory_dir / "crewai.db"))
 
 # Store structured knowledge that agents can query later
 cx.add_fact("Alice", "works_at", "Stripe", 0.95, "crewai")
@@ -159,10 +172,13 @@ from autogen_agentchat.agents import AssistantAgent
 from autogen_agentchat.teams import RoundRobinGroupChat
 from autogen_agentchat.conditions import TextMentionTermination
 from autogen_ext.models.openai import OpenAIChatCompletionClient
-from cortex_ai_memory import PyCortex
+from cortex_ai_memory import Cortex
+from pathlib import Path
 
 # Initialize Cortex
-cx = PyCortex("~/.cortex/autogen.db")
+memory_dir = Path.home() / ".cortex"
+memory_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+cx = Cortex(str(memory_dir / "autogen.db"))
 
 
 def memory_search(query: str) -> str:
@@ -236,9 +252,12 @@ asyncio.run(main())
 ### Session Lifecycle Pattern
 
 ```python
-from cortex_ai_memory import PyCortex
+from cortex_ai_memory import Cortex
+from pathlib import Path
 
-cx = PyCortex("~/.cortex/autogen.db")
+memory_dir = Path.home() / ".cortex"
+memory_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+cx = Cortex(str(memory_dir / "autogen.db"))
 
 # --- Start of session: load context ---
 context = cx.get_context(2000)
@@ -292,7 +311,7 @@ async with MultiServerMCPClient({
 
 Your LangGraph agent gets instant access to `memory_search`, `memory_ingest`, `fact_add`, `belief_observe`, `person_resolve`, and 24 more tools -- all running locally.
 
-See the [LangGraph section in README.md](../README.md#integration-with-langgraph) for full details.
+See the [LangGraph section in README.md](../../README.md#integration-with-langgraph) for full details.
 
 ---
 
@@ -322,7 +341,7 @@ mcp_servers:
 
 All DeerFlow agents (Telegram, Slack, Feishu) get instant access to 29 memory tools -- cross-session memory, fact storage, people graph, and belief tracking across all channels.
 
-See the [DeerFlow section in README.md](../README.md#integration-with-deerflow-bytedance) for full details.
+See the [DeerFlow section in README.md](../../README.md#integration-with-deerflow-bytedance) for full details.
 
 ---
 
@@ -360,7 +379,7 @@ openclaw plugin add @cortex-ai-memory/cortex-memory
 - `autoRecall` -- injects relevant memories before each turn (your agent "remembers")
 - 7 tools: `memory_search`, `memory_store`, `fact_add`, `belief_observe`, `person_resolve`, and more
 
-See the [OpenClaw section in README.md](../README.md#openclaw-plugin) and [`openclaw-plugin/README.md`](../openclaw-plugin/README.md) for full configuration options.
+See the [OpenClaw section in README.md](../../README.md#openclaw-plugin) and [`openclaw-plugin/README.md`](../../openclaw-plugin/README.md) for full configuration options.
 
 ---
 
@@ -400,4 +419,4 @@ curl -X POST http://localhost:3315/v1/facts \
   -d '{"subject": "Alice", "predicate": "works_at", "object": "Stripe", "confidence": 0.95, "channel": "api"}'
 ```
 
-See the [HTTP API section in README.md](../README.md#http-api) for the full endpoint reference.
+See the [HTTP API section in README.md](../../README.md#http-api) for the full endpoint reference.

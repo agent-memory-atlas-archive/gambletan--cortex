@@ -132,10 +132,18 @@ pub fn start_watcher(
 
 /// Check whether a filesystem event is relevant (i.e., a .jsonl file from another device).
 fn is_relevant_event(event: &Event, my_device_id: &str) -> bool {
+    // FSEvents can coalesce a newly created subtree into directory/rescan
+    // notifications, omitting individual JSONL creates. Reuse pull_remote's
+    // authenticated scan; a notification is never proof of a complete oplog.
+    if event.need_rescan() { return true; }
+    let directory_event = matches!(event.kind,
+        EventKind::Create(notify::event::CreateKind::Folder) |
+        EventKind::Remove(notify::event::RemoveKind::Folder));
     // Only care about creates (new oplog files) and close-write events.
     // Skip Modify events to avoid reading partially-written files.
     match event.kind {
         EventKind::Create(_) => {}
+        EventKind::Remove(notify::event::RemoveKind::Folder) => {}
         EventKind::Modify(notify::event::ModifyKind::Data(_)) => {}
         EventKind::Access(notify::event::AccessKind::Close(notify::event::AccessMode::Write)) => {}
         _ => return false,
@@ -146,7 +154,7 @@ fn is_relevant_event(event: &Event, my_device_id: &str) -> bool {
         let is_jsonl = path
             .extension()
             .is_some_and(|ext| ext == "jsonl");
-        if !is_jsonl {
+        if !is_jsonl && !directory_event {
             return false;
         }
 
@@ -199,4 +207,21 @@ mod tests {
         };
         assert!(!is_relevant_event(&event, "device-a"));
     }
+    #[test]
+    fn coalesced_remote_directory_requires_scan_but_own_directory_does_not() {
+        let mut event=Event::new(EventKind::Create(CreateKind::Folder))
+            .add_path(PathBuf::from("/sync/devices/device-b"));
+        assert!(is_relevant_event(&event,"device-a"));
+        event.paths=vec![PathBuf::from("/sync/devices/device-a")];
+        assert!(!is_relevant_event(&event,"device-a"));
+        event.paths.push(PathBuf::from("/sync/devices/device-b"));
+        assert!(is_relevant_event(&event,"device-a"));
+    }
+    #[test]
+    fn dropped_event_rescan_uses_existing_authenticated_pull() {
+        let mut event=Event::new(EventKind::Other);
+        event.attrs.set_flag(notify::event::Flag::Rescan);
+        assert!(is_relevant_event(&event,"device-a"));
+    }
+
 }

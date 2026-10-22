@@ -1,6 +1,6 @@
 [package]
 name = "cortex-python"
-version = "2.4.0"
+version = "2.5.0"
 edition = "2021"
 rust-version = "1.89"
 
@@ -15,5 +15,8 @@ crate-type = ["cdylib"]
 # cortex-core proper and is unaffected. (Opt back in with a feature if a wheel ever needs
 # SQLCipher and the build env supports it.)
 cortex-core = { path = "../cortex-core", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+parking_lot = "0.12"
 pyo3 = { version = "0.23", features = ["extension-module"] }
 uuid = { version = "1", features = ["v4"] }

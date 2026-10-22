@@ -19,7 +19,8 @@ fn test_open_with_config() {
         ..Default::default()
     };
     // Use a temp path
-    let path = format!("/tmp/cortex_test_{}.db", uuid::Uuid::new_v4());
+    let private_dir = tempfile::tempdir().unwrap();
+    let path = private_dir.path().join("memory.db").to_string_lossy().into_owned();
     let cortex = Cortex::open_with_config(&path, config).unwrap();
 
     // Should work normally

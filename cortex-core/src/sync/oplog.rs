@@ -115,19 +115,23 @@ impl OpLogWriter {
             op.hmac = Some(base64::engine::general_purpose::STANDARD.encode(hmac_bytes));
         }
 
-        let mut json = serde_json::to_string(&op)
-            .map_err(|e| CortexError::Serialization(e.to_string()))?;
+        let mut json = zeroize::Zeroizing::new(serde_json::to_string(&op)
+            .map_err(|e| CortexError::Serialization(e.to_string()))?);
 
-        let line = if let Some(ref ctx) = self.crypto {
+        let line = zeroize::Zeroizing::new(if let Some(ref ctx) = self.crypto {
             crate::sync::crypto::encrypt_line(ctx, json.as_bytes())?
         } else {
-            json.clone()
-        };
+            json.to_string()
+        });
 
         let file = self.current_file.as_mut()
             .ok_or_else(|| CortexError::Storage("No open oplog file".into()))?;
-        writeln!(file, "{}", line)
-            .map_err(|e| CortexError::Storage(format!("Failed to write oplog: {}", e)))?;
+        if let Err(error) = writeln!(file, "{}", line.as_str()) {
+            // A failed write can leave an arbitrary prefix. Never acknowledge a
+            // later operation by appending it to that prefix, even without restart.
+            self.current_file.take();
+            return Err(CortexError::Storage(format!("Failed to write oplog: {error}")));
+        }
 
         // Zeroize plaintext JSON from memory
         json.zeroize();
@@ -138,8 +142,10 @@ impl OpLogWriter {
     /// Flush the oplog file to disk.
     pub fn flush(&mut self) -> Result<(), CortexError> {
         if let Some(ref mut file) = self.current_file {
-            file.flush()
-                .map_err(|e| CortexError::Storage(format!("Failed to flush oplog: {}", e)))?;
+            if let Err(error) = file.flush() {
+                self.current_file.take();
+                return Err(CortexError::Storage(format!("Failed to flush oplog: {error}")));
+            }
         }
         Ok(())
     }
@@ -167,7 +173,24 @@ impl OpLogWriter {
             loop {
                 let name = format!("oplog-{}-{:03}.jsonl", self.current_date, self.current_seq);
                 let path = self.device_dir.join(&name);
-                if !path.exists() || fs::metadata(&path).map(|m| m.len()).unwrap_or(0) < MAX_FILE_SIZE {
+                // Never append an acknowledged operation onto a crash-truncated
+                // record. Preserve that file and rotate; readers retain its cursor
+                // independently and continue with the next file.
+                let appendable = match File::open(&path) {
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+                    Err(e) => return Err(CortexError::Storage(format!("Failed to inspect oplog: {e}"))),
+                    Ok(mut existing) => {
+                        use std::io::{Read, Seek, SeekFrom};
+                        let size = existing.metadata().map_err(|e| CortexError::Storage(e.to_string()))?.len();
+                        if size == 0 { true } else if size >= MAX_FILE_SIZE { false } else {
+                            existing.seek(SeekFrom::End(-1)).map_err(|e| CortexError::Storage(e.to_string()))?;
+                            let mut last = [0u8;1];
+                            existing.read_exact(&mut last).map_err(|e| CortexError::Storage(e.to_string()))?;
+                            last[0] == b'\n'
+                        }
+                    }
+                };
+                if appendable {
                     self.current_path = path;
                     break;
                 }
@@ -209,13 +232,23 @@ pub fn read_oplog(
     const CORRUPTION_THRESHOLD: u32 = 5; // Alert if 5+ consecutive HMAC failures
 
     loop {
-        let mut line = String::new();
-        let bytes_read = reader.read_line(&mut line)
-            .map_err(|e| CortexError::Storage(format!("Failed to read oplog line: {}", e)))?;
-
-        if bytes_read == 0 {
-            break; // EOF
-        }
+        let mut buffer = zeroize::Zeroizing::new(Vec::new());
+        let bytes_read = reader.read_until(b'\n', &mut buffer)
+            .map_err(|e| CortexError::Storage(format!("Failed to read oplog line: {e}")))?;
+        if bytes_read == 0 { break; }
+        // Publication is checked in bytes: a crash may split a UTF-8 codepoint.
+        // All incomplete tails retain their cursor before decoding/authentication.
+        if !buffer.ends_with(b"\n") { break; }
+        let line = match std::str::from_utf8(&buffer) {
+            Ok(line) => line,
+            Err(_) => {
+                // A terminated malformed record follows the existing complete
+                // corrupt-record policy; no bytes are authenticated or applied.
+                tracing::warn!("Invalid UTF-8 in completed oplog record at offset {}", offset);
+                offset += bytes_read as u64;
+                continue;
+            }
+        };
 
         let trimmed = line.trim();
         if trimmed.is_empty() {
@@ -384,12 +417,8 @@ pub fn read_oplog(
                 offset += bytes_read as u64;
             }
             Err(_) => {
-                // Distinguish partial write (incomplete line) from permanent corruption:
-                // - If the raw line ends with '\n', it's a complete but corrupt line → skip it
-                // - If at EOF without '\n', it's likely a partial write → don't advance, retry
-                // Always advance past bad lines to avoid stalling sync.
-                // Partial writes (no trailing \n) are also skipped — the writer
-                // uses flush() which guarantees complete lines on disk.
+                // Only newline-terminated records reach this branch. Skip complete
+                // corrupt records; an incomplete tail above retains its cursor.
                 tracing::warn!("Skipping invalid oplog line at offset {}", offset);
 
                 // Zeroize plaintext JSON from memory
@@ -606,4 +635,46 @@ mod tests {
         let parsed: SyncOp = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.op_id, op.op_id);
     }
+}
+
+#[cfg(all(test,unix))]
+mod write_failure_tests {
+    use super::*;
+    use std::time::{Duration,Instant};
+    #[test]
+    fn limited_writer_child() {
+        let Ok(root)=std::env::var("CORTEX_TEST_LIMITED_WRITER_ROOT") else { return; };
+        let encrypted=std::env::var("CORTEX_TEST_LIMITED_WRITER_ENCRYPTED").unwrap()=="1";
+        let crypto=encrypted.then(||std::sync::Arc::new(crate::sync::crypto::derive_key("test-only-io-failure",&crate::sync::crypto::new_encryption_manifest()).unwrap()));
+        let root=PathBuf::from(root);
+        let make=||SyncOp {op_id:Uuid::new_v4(),hlc:HlcTimestamp::new(1000,0,"io-writer"),payload:SyncPayload::MemoryDelete {id:Uuid::new_v4()},hmac:None};
+        let mut writer=OpLogWriter::new(root.clone(),crypto.clone()).unwrap();
+        let first=make();writer.append(first.clone()).unwrap();
+        let old=writer.current_path.clone();let before=fs::metadata(&old).unwrap().len();
+        let mut previous=std::mem::MaybeUninit::<libc::rlimit>::uninit();
+        assert_eq!(unsafe {libc::getrlimit(libc::RLIMIT_FSIZE,previous.as_mut_ptr())},0);
+        let previous=unsafe {previous.assume_init()};
+        struct Restore {limit:libc::rlimit,handler:libc::sighandler_t}
+        impl Drop for Restore { fn drop(&mut self) {assert_eq!(unsafe {libc::setrlimit(libc::RLIMIT_FSIZE,&self.limit)},0);unsafe {libc::signal(libc::SIGXFSZ,self.handler);}} }
+        let restore=Restore {limit:previous,handler:unsafe {libc::signal(libc::SIGXFSZ,libc::SIG_IGN)}};
+        let capped=libc::rlimit {rlim_cur:(before+32) as libc::rlim_t,rlim_max:previous.rlim_max};
+        assert_eq!(unsafe {libc::setrlimit(libc::RLIMIT_FSIZE,&capped)},0);
+        assert!(writer.append(make()).is_err(),"real file-size limit must interrupt append");
+        let partial=fs::metadata(&old).unwrap().len();assert!(partial>before);assert_eq!(partial,before+32);
+        drop(restore);
+        let next=make();writer.append(next.clone()).unwrap();drop(writer);
+        let mut ops=Vec::new();for file in list_oplog_files(&root).unwrap() {ops.extend(read_oplog(&file,0,crypto.as_deref()).unwrap().0);}
+        assert_eq!(ops.len(),2,"acknowledged append after same-writer recovery must survive");assert_eq!(ops[0].op_id,first.op_id);assert_eq!(ops[1].op_id,next.op_id);
+    }
+    fn run_limited_writer(encrypted:bool) {
+        let dir=tempfile::tempdir().unwrap();
+        let mut child=std::process::Command::new(std::env::current_exe().unwrap()).args(["sync::oplog::write_failure_tests::limited_writer_child","--exact","--nocapture"]).env("CORTEX_TEST_LIMITED_WRITER_ROOT",dir.path()).env("CORTEX_TEST_LIMITED_WRITER_ENCRYPTED",if encrypted {"1"}else{"0"}).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn().unwrap();
+        let deadline=Instant::now()+Duration::from_secs(30);
+        while child.try_wait().unwrap().is_none() { if Instant::now()>=deadline {let _=child.kill();let _=child.wait();panic!("limited writer child timed out");}std::thread::sleep(Duration::from_millis(10));}
+        let output=child.wait_with_output().unwrap();assert!(output.status.success(),"limited child failed: {} {}",String::from_utf8_lossy(&output.stdout),String::from_utf8_lossy(&output.stderr));
+    }
+    #[test]
+    fn plaintext_partial_write_failure_recovers_same_writer() {run_limited_writer(false);}
+    #[test]
+    fn encrypted_partial_write_failure_recovers_same_writer() {run_limited_writer(true);}
 }
