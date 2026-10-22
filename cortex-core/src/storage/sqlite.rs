@@ -64,20 +64,26 @@ impl SqliteStorage {
         // (another connection holds the checkpoint lock): retry, never report success.
         for attempt in 0..20 {
             let (busy, log, done): (i64, i64, i64) = conn
-                .query_row("PRAGMA wal_checkpoint(FULL)", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .query_row("PRAGMA wal_checkpoint(FULL)", [], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+                })
                 .map_err(|e| CortexError::Storage(e.to_string()))?;
             if busy == 0 && done >= log {
                 return Ok(());
             }
             std::thread::sleep(std::time::Duration::from_millis(25 * (attempt + 1)));
         }
-        Err(CortexError::Storage("could not make the change durable (database busy); try again".into()))
+        Err(CortexError::Storage(
+            "could not make the change durable (database busy); try again".into(),
+        ))
     }
 
     /// The database file, or `None` for an in-memory database.
     pub fn db_path(&self) -> Option<std::path::PathBuf> {
         let conn = self.write_conn.lock();
-        conn.path().filter(|p| !p.is_empty()).map(std::path::PathBuf::from)
+        conn.path()
+            .filter(|p| !p.is_empty())
+            .map(std::path::PathBuf::from)
     }
 
     /// Open a Cortex database with optional encryption passphrase.
@@ -90,9 +96,15 @@ impl SqliteStorage {
     /// Open with a raw 256-bit SQLCipher key (no per-open PBKDF2), `readers` read
     /// connections, and fully durable commits (`synchronous=FULL`). For services that open many small databases (one per tenant).
     /// Fails if SQLCipher is not compiled in: a raw key must never silently mean plaintext.
-    pub fn open_with_raw_key(path: &str, key: &[u8; 32], readers: usize) -> Result<Self, CortexError> {
+    pub fn open_with_raw_key(
+        path: &str,
+        key: &[u8; 32],
+        readers: usize,
+    ) -> Result<Self, CortexError> {
         if !cfg!(feature = "encrypted-db") {
-            return Err(CortexError::Storage("encrypted-db feature is required for a raw key".into()));
+            return Err(CortexError::Storage(
+                "encrypted-db feature is required for a raw key".into(),
+            ));
         }
         let storage = Self::open_keyed(path, Some(DbKey::Raw(key)), readers.max(1))?;
         // Services acknowledge writes to remote clients (e.g. "unshared"): a commit must
@@ -108,14 +120,16 @@ impl SqliteStorage {
     fn apply_key(conn: &Connection, key: Option<&DbKey>) -> Result<(), CortexError> {
         #[cfg(feature = "encrypted-db")]
         match key {
-            Some(DbKey::Passphrase(p)) => conn
-                .pragma_update(None, "key", p)
-                .map_err(|e| CortexError::Storage(format!("Failed to set encryption key: {}", e)))?,
+            Some(DbKey::Passphrase(p)) => conn.pragma_update(None, "key", p).map_err(|e| {
+                CortexError::Storage(format!("Failed to set encryption key: {}", e))
+            })?,
             Some(DbKey::Raw(k)) => {
                 let hex: String = k.iter().map(|b| format!("{b:02x}")).collect();
                 // SQLCipher raw-key syntax: PRAGMA key = "x'<64 hex>'" (hex only; no injection).
                 conn.execute_batch(&format!("PRAGMA key = \"x'{hex}'\";"))
-                    .map_err(|e| CortexError::Storage(format!("Failed to set encryption key: {}", e)))?
+                    .map_err(|e| {
+                        CortexError::Storage(format!("Failed to set encryption key: {}", e))
+                    })?
             }
             None => {}
         }
@@ -132,26 +146,61 @@ impl SqliteStorage {
     /// main file's mode — and tightens files left group/world-readable by older releases.
     #[cfg(unix)]
     fn restrict_db_file_mode(path: &str) -> Result<(), CortexError> {
-        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-        if path.is_empty() || path == ":memory:" || path.starts_with("file:") {
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+        if path == ":memory:" {
             return Ok(());
         }
-        std::fs::OpenOptions::new()
+        // URI filenames have aliases and query parameters; accepting them here
+        // would let SQLite open a different file than the descriptor we secure.
+        if path.is_empty() || path.starts_with("file:") {
+            return Err(CortexError::InvalidInput(
+                "use a filesystem path or :memory:".into(),
+            ));
+        }
+        let main = std::fs::OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(false)
             .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
             .open(path)
             .map_err(|e| CortexError::Storage(e.to_string()))?;
         for suffix in ["", "-wal", "-shm", "-journal"] {
-            let p = format!("{path}{suffix}");
-            let Ok(meta) = std::fs::metadata(&p) else { continue };
-            let mode = meta.permissions().mode();
-            if mode & 0o077 != 0 {
-                // Not fatal (e.g. a file owned by someone else), but never silent.
-                if let Err(e) = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(mode & 0o700)) {
-                    tracing::warn!("could not restrict permissions on {p}: {e}");
+            let file = if suffix.is_empty() {
+                main.try_clone()
+            } else {
+                match std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .custom_flags(libc::O_NOFOLLOW)
+                    .open(format!("{path}{suffix}"))
+                {
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                    other => other,
                 }
+            }
+            .map_err(|e| CortexError::Storage(e.to_string()))?;
+            let meta = file
+                .metadata()
+                .map_err(|e| CortexError::Storage(e.to_string()))?;
+            if !meta.is_file() || meta.uid() != unsafe { libc::geteuid() } || meta.nlink() != 1 {
+                return Err(CortexError::Storage(
+                    "database must be an owner-owned regular file".into(),
+                ));
+            }
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))
+                .map_err(|e| CortexError::Storage(e.to_string()))?;
+            if file
+                .metadata()
+                .map_err(|e| CortexError::Storage(e.to_string()))?
+                .permissions()
+                .mode()
+                & 0o777
+                != 0o600
+            {
+                return Err(CortexError::Storage(
+                    "database permissions are not private".into(),
+                ));
             }
         }
         Ok(())
@@ -164,36 +213,78 @@ impl SqliteStorage {
     pub(crate) fn open_controlled(path: &str) -> Result<Self, CortexError> {
         let storage = Self::open_keyed_mode(path, None, 1, true)?;
         storage.with_write_conn(|conn| {
-            conn.execute_batch("PRAGMA synchronous=FULL;")
+            // Controlled queries probe exact authorized rowids. Keep FTS docids
+            // aligned with memories; legacy databases retain their old layout.
+            conn.execute_batch("PRAGMA synchronous=FULL;
+                BEGIN IMMEDIATE;
+                DROP TRIGGER IF EXISTS memories_fts_ai;
+                DROP TRIGGER IF EXISTS memories_fts_ad;
+                DROP TRIGGER IF EXISTS memories_fts_au;
+                CREATE TRIGGER memories_fts_ai AFTER INSERT ON memories BEGIN
+                  INSERT INTO memories_fts(rowid,id,content) VALUES(NEW.rowid,NEW.id,NEW.content_json); END;
+                CREATE TRIGGER memories_fts_ad AFTER DELETE ON memories BEGIN
+                  DELETE FROM memories_fts WHERE rowid=OLD.rowid; END;
+                CREATE TRIGGER memories_fts_au AFTER UPDATE OF content_json ON memories BEGIN
+                  DELETE FROM memories_fts WHERE rowid=OLD.rowid;
+                  INSERT INTO memories_fts(rowid,id,content) VALUES(NEW.rowid,NEW.id,NEW.content_json); END;
+                DELETE FROM memories_fts;
+                INSERT INTO memories_fts(rowid,id,content) SELECT rowid,id,content_json FROM memories;
+                COMMIT;")
                 .map_err(|e| CortexError::Storage(e.to_string()))
         })?;
         Ok(storage)
     }
 
-    fn open_keyed_mode(path: &str, key: Option<DbKey>, readers: usize, controlled: bool) -> Result<Self, CortexError> {
+    fn open_keyed_mode(
+        path: &str,
+        key: Option<DbKey>,
+        readers: usize,
+        controlled: bool,
+    ) -> Result<Self, CortexError> {
         #[cfg(unix)]
         Self::restrict_db_file_mode(path)?;
         let conn = Connection::open(path).map_err(|e| CortexError::Storage(e.to_string()))?;
         Self::apply_key(&conn, key.as_ref())?;
 
-        let marked: bool = conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='cortex_controlled_marker')", [], |r| r.get(0)
-        ).map_err(|e| CortexError::Storage(e.to_string()))?;
+        let marked: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='cortex_controlled_marker')",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(|e| CortexError::Storage(e.to_string()))?;
         if marked && !controlled {
-            return Err(CortexError::InvalidInput("controlled database requires ControlledStore".into()));
+            return Err(CortexError::InvalidInput(
+                "controlled database requires ControlledStore".into(),
+            ));
         }
         if controlled && !marked {
-            let nonempty: bool = conn.query_row(
-                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name NOT LIKE 'sqlite_%')", [], |r| r.get(0)
-            ).map_err(|e| CortexError::Storage(e.to_string()))?;
-            if nonempty { return Err(CortexError::InvalidInput("cannot import a personal database".into())); }
+            let nonempty: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name NOT LIKE 'sqlite_%')",
+                    [],
+                    |r| r.get(0),
+                )
+                .map_err(|e| CortexError::Storage(e.to_string()))?;
+            if nonempty {
+                return Err(CortexError::InvalidInput(
+                    "cannot import a personal database".into(),
+                ));
+            }
             conn.execute_batch("BEGIN IMMEDIATE; CREATE TABLE cortex_controlled_marker(version INTEGER NOT NULL); INSERT INTO cortex_controlled_marker VALUES(1); COMMIT;")
                 .map_err(|e| CortexError::Storage(e.to_string()))?;
         }
         if controlled {
-            let version: i64 = conn.query_row("SELECT version FROM cortex_controlled_marker", [], |r| r.get(0))
+            let version: i64 = conn
+                .query_row("SELECT version FROM cortex_controlled_marker", [], |r| {
+                    r.get(0)
+                })
                 .map_err(|e| CortexError::Storage(e.to_string()))?;
-            if version != 1 { return Err(CortexError::InvalidInput("unsupported controlled store format".into())); }
+            if version != 1 {
+                return Err(CortexError::InvalidInput(
+                    "unsupported controlled store format".into(),
+                ));
+            }
         }
 
         conn.execute_batch(
@@ -238,10 +329,9 @@ impl SqliteStorage {
         // Deletes are permanent: FTS5 otherwise keeps deleted terms in index segments
         // until a merge (secure_delete only scrubs freed b-tree pages). Needs SQLite
         // 3.42+; on older builds scrub_after_delete falls back to an index rebuild.
-        let _ = storage
-            .write_conn
-            .lock()
-            .execute_batch("INSERT INTO memories_fts(memories_fts, rank) VALUES('secure-delete', 1);");
+        let _ = storage.write_conn.lock().execute_batch(
+            "INSERT INTO memories_fts(memories_fts, rank) VALUES('secure-delete', 1);",
+        );
         Ok(storage)
     }
 
@@ -249,37 +339,40 @@ impl SqliteStorage {
     /// index, then fold the WAL back into the (zero-scrubbed) database and truncate it so
     /// the plaintext does not linger in old WAL frames. Best effort: a reader holding a
     /// snapshot can block the checkpoint; the next delete or autocheckpoint retries.
-    pub(crate) fn scrub_after_delete(conn: &Connection) {
-        let fts_secure_delete = conn
-            .query_row(
-                "SELECT v FROM memories_fts_config WHERE k = 'secure-delete'",
-                [],
-                |r| r.get::<_, i64>(0),
-            )
-            .is_ok_and(|v| v != 0);
-        if !fts_secure_delete {
-            if let Err(e) =
-                conn.execute_batch("INSERT INTO memories_fts(memories_fts) VALUES('optimize');")
-            {
-                tracing::warn!(error = %e, "FTS scrub after delete failed");
-            }
+    pub(crate) fn scrub_after_delete(conn: &Connection) -> bool {
+        // A snapshot reader can block truncation indefinitely. Cleanup is bounded;
+        // controlled callers persist and expose a retryable pending flag.
+        if conn.busy_timeout(std::time::Duration::ZERO).is_err() {
+            return false;
         }
-        for attempt in 0..3 {
-            match conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| r.get::<_, i64>(0)) {
-                Ok(0) => return,
-                Ok(_) => std::thread::sleep(std::time::Duration::from_millis(10 * (attempt + 1))),
-                Err(e) => {
-                    tracing::warn!(error = %e, "WAL scrub after delete failed");
-                    return;
-                }
+        let started = std::time::Instant::now();
+        conn.progress_handler(1000, Some(move || started.elapsed() >= std::time::Duration::from_millis(250)));
+        let result = (|| -> rusqlite::Result<bool> {
+            let secure = conn
+                .query_row(
+                    "SELECT v FROM memories_fts_config WHERE k = 'secure-delete'",
+                    [],
+                    |r| r.get::<_, i64>(0),
+                )
+                .is_ok_and(|v| v != 0);
+            if !secure {
+                conn.execute_batch("INSERT INTO memories_fts(memories_fts) VALUES('optimize');")?;
             }
-        }
-        tracing::warn!("WAL scrub after delete skipped: database busy");
+            Ok(conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
+                r.get::<_, i64>(0)
+            })? == 0)
+        })()
+        .unwrap_or(false);
+        conn.progress_handler(0, None::<fn() -> bool>);
+        let restored = conn
+            .busy_timeout(std::time::Duration::from_millis(5000))
+            .is_ok();
+        if !result || !restored { tracing::warn!("SQLite physical cleanup remains pending"); }
+        result && restored
     }
 
     pub fn open_in_memory() -> Result<Self, CortexError> {
-        let conn =
-            Connection::open_in_memory().map_err(|e| CortexError::Storage(e.to_string()))?;
+        let conn = Connection::open_in_memory().map_err(|e| CortexError::Storage(e.to_string()))?;
         conn.execute_batch("PRAGMA foreign_keys=ON;")
             .map_err(|e| CortexError::Storage(e.to_string()))?;
         // In-memory DBs can't share connections, so read_pool is empty
@@ -321,7 +414,10 @@ impl SqliteStorage {
         f(&conn)
     }
 
-    pub(crate) fn insert_on_connection(conn: &Connection, mem: &MemObject) -> Result<(), CortexError> {
+    pub(crate) fn insert_on_connection(
+        conn: &Connection,
+        mem: &MemObject,
+    ) -> Result<(), CortexError> {
         let now = Utc::now().to_rfc3339();
         let embedding_blob = mem.embedding.as_ref().map(|e| f32_vec_to_bytes(e));
         let content_json = serde_json::to_string(&mem.content).unwrap();
@@ -334,29 +430,29 @@ impl SqliteStorage {
             )
             .map_err(|e| CortexError::Storage(e.to_string()))?;
         stmt.execute(params![
-                id_str,
-                mem.tier.as_str(),
-                content_json,
-                embedding_blob,
-                serde_json::to_string(&mem.temporal).unwrap(),
-                serde_json::to_string(&mem.source).unwrap(),
-                serde_json::to_string(&mem.salience).unwrap(),
-                serialize_privacy(&mem.privacy),
-                serialize_tags(&mem.tags),
-                serialize_metadata(&mem.metadata),
-                serialize_links(&mem.links),
-                mem.content_hash,
-                mem.namespace,
-                mem.salience.effective_score,
-                fact_subject,
-                fact_object,
-                pref_key,
-                mem.source.channel,
-                mem.source.identity_id.map(|id| id.to_string()),
-                now,
-                now,
-            ])
-            .map_err(|e| CortexError::Storage(e.to_string()))?;
+            id_str,
+            mem.tier.as_str(),
+            content_json,
+            embedding_blob,
+            serde_json::to_string(&mem.temporal).unwrap(),
+            serde_json::to_string(&mem.source).unwrap(),
+            serde_json::to_string(&mem.salience).unwrap(),
+            serialize_privacy(&mem.privacy),
+            serialize_tags(&mem.tags),
+            serialize_metadata(&mem.metadata),
+            serialize_links(&mem.links),
+            mem.content_hash,
+            mem.namespace,
+            mem.salience.effective_score,
+            fact_subject,
+            fact_object,
+            pref_key,
+            mem.source.channel,
+            mem.source.identity_id.map(|id| id.to_string()),
+            now,
+            now,
+        ])
+        .map_err(|e| CortexError::Storage(e.to_string()))?;
 
         Ok(())
     }
@@ -367,7 +463,9 @@ impl SqliteStorage {
     }
 
     pub(crate) fn with_controlled_conn<F, R, E>(&self, f: F) -> Result<R, E>
-    where F: FnOnce(&Connection) -> Result<R, E> {
+    where
+        F: FnOnce(&Connection) -> Result<R, E>,
+    {
         f(&self.write_conn.lock())
     }
 
@@ -450,11 +548,12 @@ impl SqliteStorage {
         } else {
             Self::json_col(8, &tags_json)?
         };
-        let metadata: std::collections::HashMap<String, serde_json::Value> = if metadata_json == "{}" {
-            std::collections::HashMap::new()
-        } else {
-            Self::json_col(9, &metadata_json)?
-        };
+        let metadata: std::collections::HashMap<String, serde_json::Value> =
+            if metadata_json == "{}" {
+                std::collections::HashMap::new()
+            } else {
+                Self::json_col(9, &metadata_json)?
+            };
         let links: Vec<MemLink> = if links_json == "[]" {
             Vec::new()
         } else {
@@ -529,14 +628,18 @@ fn serialize_links(links: &[MemLink]) -> String {
 
 /// Extract materialized column values from memory content.
 /// Returns (fact_subject, fact_object, pref_key) — all lowercased for indexed LIKE queries.
-fn extract_materialized_columns(content: &MemContent) -> (Option<String>, Option<String>, Option<String>) {
+fn extract_materialized_columns(
+    content: &MemContent,
+) -> (Option<String>, Option<String>, Option<String>) {
     match content {
-        MemContent::Fact { subject, object, .. } => {
-            (Some(subject.to_lowercase()), Some(object.to_lowercase()), None)
-        }
-        MemContent::Preference { key, .. } => {
-            (None, None, Some(key.to_lowercase()))
-        }
+        MemContent::Fact {
+            subject, object, ..
+        } => (
+            Some(subject.to_lowercase()),
+            Some(object.to_lowercase()),
+            None,
+        ),
+        MemContent::Preference { key, .. } => (None, None, Some(key.to_lowercase())),
         _ => (None, None, None),
     }
 }
@@ -555,8 +658,12 @@ fn f32_vec_to_bytes(v: &[f32]) -> Vec<u8> {
     let mut min_val = f32::INFINITY;
     let mut max_val = f32::NEG_INFINITY;
     for &f in v {
-        if f < min_val { min_val = f; }
-        if f > max_val { max_val = f; }
+        if f < min_val {
+            min_val = f;
+        }
+        if f > max_val {
+            max_val = f;
+        }
     }
     let range = max_val - min_val;
 
@@ -711,9 +818,7 @@ impl StorageBackend for SqliteStorage {
         .map_err(|e| CortexError::Storage(e.to_string()))?;
 
         // Migration: create FTS5 virtual table for full-text search
-        let has_fts: bool = conn
-            .prepare("SELECT * FROM memories_fts LIMIT 0")
-            .is_ok();
+        let has_fts: bool = conn.prepare("SELECT * FROM memories_fts LIMIT 0").is_ok();
         if !has_fts {
             conn.execute_batch(
                 "CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
@@ -838,7 +943,6 @@ impl StorageBackend for SqliteStorage {
         Ok(result)
     }
 
-
     fn update_memory(&self, mem: &MemObject) -> Result<(), CortexError> {
         let conn = self.write_conn.lock();
         let now = Utc::now().to_rfc3339();
@@ -852,28 +956,28 @@ impl StorageBackend for SqliteStorage {
             )
             .map_err(|e| CortexError::Storage(e.to_string()))?;
         stmt.execute(params![
-                id_str,
-                mem.tier.as_str(),
-                content_json,
-                embedding_blob,
-                serde_json::to_string(&mem.temporal).unwrap(),
-                serde_json::to_string(&mem.source).unwrap(),
-                serde_json::to_string(&mem.salience).unwrap(),
-                serialize_privacy(&mem.privacy),
-                serialize_tags(&mem.tags),
-                serialize_metadata(&mem.metadata),
-                serialize_links(&mem.links),
-                mem.content_hash,
-                mem.namespace,
-                mem.salience.effective_score,
-                fact_subject,
-                fact_object,
-                pref_key,
-                mem.source.channel,
-                mem.source.identity_id.map(|id| id.to_string()),
-                now,
-            ])
-            .map_err(|e| CortexError::Storage(e.to_string()))?;
+            id_str,
+            mem.tier.as_str(),
+            content_json,
+            embedding_blob,
+            serde_json::to_string(&mem.temporal).unwrap(),
+            serde_json::to_string(&mem.source).unwrap(),
+            serde_json::to_string(&mem.salience).unwrap(),
+            serialize_privacy(&mem.privacy),
+            serialize_tags(&mem.tags),
+            serialize_metadata(&mem.metadata),
+            serialize_links(&mem.links),
+            mem.content_hash,
+            mem.namespace,
+            mem.salience.effective_score,
+            fact_subject,
+            fact_object,
+            pref_key,
+            mem.source.channel,
+            mem.source.identity_id.map(|id| id.to_string()),
+            now,
+        ])
+        .map_err(|e| CortexError::Storage(e.to_string()))?;
 
         // FTS5 synced via trigger (memories_fts_au)
         self.cache_put(mem);
@@ -896,11 +1000,7 @@ impl StorageBackend for SqliteStorage {
         Ok(())
     }
 
-    fn list_by_tier(
-        &self,
-        tier: MemoryTier,
-        limit: usize,
-    ) -> Result<Vec<MemObject>, CortexError> {
+    fn list_by_tier(&self, tier: MemoryTier, limit: usize) -> Result<Vec<MemObject>, CortexError> {
         let conn = self.read_conn()?;
         let mut stmt = conn
             .prepare_cached(
@@ -943,11 +1043,7 @@ impl StorageBackend for SqliteStorage {
         Ok(results)
     }
 
-    fn list_by_channel(
-        &self,
-        channel: &str,
-        limit: usize,
-    ) -> Result<Vec<MemObject>, CortexError> {
+    fn list_by_channel(&self, channel: &str, limit: usize) -> Result<Vec<MemObject>, CortexError> {
         let conn = self.read_conn()?;
         let mut stmt = conn
             .prepare_cached(
@@ -1021,15 +1117,17 @@ impl StorageBackend for SqliteStorage {
         let mut stmt = conn
             .prepare_cached("INSERT OR REPLACE INTO links (source_id, target_id, relation, strength) VALUES (?1, ?2, ?3, ?4)")
             .map_err(|e| CortexError::Storage(e.to_string()))?;
-        stmt.execute(params![source_id.to_string(), target_id.to_string(), relation.as_str(), strength])
+        stmt.execute(params![
+            source_id.to_string(),
+            target_id.to_string(),
+            relation.as_str(),
+            strength
+        ])
         .map_err(|e| CortexError::Storage(e.to_string()))?;
         Ok(())
     }
 
-    fn get_links(
-        &self,
-        source_id: Uuid,
-    ) -> Result<Vec<(Uuid, LinkRelation, f32)>, CortexError> {
+    fn get_links(&self, source_id: Uuid) -> Result<Vec<(Uuid, LinkRelation, f32)>, CortexError> {
         let conn = self.read_conn()?;
         let mut stmt = conn
             .prepare_cached("SELECT target_id, relation, strength FROM links WHERE source_id = ?1")
@@ -1046,10 +1144,9 @@ impl StorageBackend for SqliteStorage {
         for row in rows {
             let (target_str, rel_str, strength) =
                 row.map_err(|e| CortexError::Storage(e.to_string()))?;
-            let target = Uuid::parse_str(&target_str)
-                .map_err(|e| CortexError::Storage(e.to_string()))?;
-            let relation =
-                LinkRelation::parse(&rel_str).unwrap_or(LinkRelation::RelatedTo);
+            let target =
+                Uuid::parse_str(&target_str).map_err(|e| CortexError::Storage(e.to_string()))?;
+            let relation = LinkRelation::parse(&rel_str).unwrap_or(LinkRelation::RelatedTo);
             results.push((target, relation, strength));
         }
         Ok(results)
@@ -1126,10 +1223,7 @@ impl StorageBackend for SqliteStorage {
             )
             .map_err(|e| CortexError::Storage(e.to_string()))?;
         let person = stmt
-            .query_row(
-                params![channel, channel_user_id],
-                parse_person_row,
-            )
+            .query_row(params![channel, channel_user_id], parse_person_row)
             .optional()
             .map_err(|e| CortexError::Storage(e.to_string()))?;
 
@@ -1373,9 +1467,14 @@ impl StorageBackend for SqliteStorage {
                 "SELECT id, tier, content_json, embedding_blob, temporal_json, source_json, salience_json, privacy_json, tags_json, metadata_json, links_json, content_hash, namespace FROM memories WHERE id IN ({})",
                 placeholders.join(", ")
             );
-            let mut stmt = conn.prepare(&sql).map_err(|e| CortexError::Storage(e.to_string()))?;
+            let mut stmt = conn
+                .prepare(&sql)
+                .map_err(|e| CortexError::Storage(e.to_string()))?;
             let id_strings: Vec<String> = miss_ids.iter().map(|id| id.to_string()).collect();
-            let params: Vec<&dyn rusqlite::types::ToSql> = id_strings.iter().map(|s| s as &dyn rusqlite::types::ToSql).collect();
+            let params: Vec<&dyn rusqlite::types::ToSql> = id_strings
+                .iter()
+                .map(|s| s as &dyn rusqlite::types::ToSql)
+                .collect();
             let rows = stmt
                 .query_map(params.as_slice(), Self::parse_mem_row)
                 .map_err(|e| CortexError::Storage(e.to_string()))?;
@@ -1444,12 +1543,16 @@ impl StorageBackend for SqliteStorage {
              ORDER BY created_at DESC",
             conditions.join(" OR ")
         );
-        let mut stmt = conn.prepare(&sql).map_err(|e| CortexError::Storage(e.to_string()))?;
-        let mut params_vec: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::with_capacity(entities.len());
+        let mut stmt = conn
+            .prepare(&sql)
+            .map_err(|e| CortexError::Storage(e.to_string()))?;
+        let mut params_vec: Vec<Box<dyn rusqlite::types::ToSql>> =
+            Vec::with_capacity(entities.len());
         for entity in entities {
             params_vec.push(Box::new(format!("%{}%", entity.to_lowercase())));
         }
-        let param_refs: Vec<&dyn rusqlite::types::ToSql> = params_vec.iter().map(|p| p.as_ref()).collect();
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+            params_vec.iter().map(|p| p.as_ref()).collect();
         let rows = stmt
             .query_map(param_refs.as_slice(), Self::parse_mem_row)
             .map_err(|e| CortexError::Storage(e.to_string()))?;
@@ -1621,7 +1724,10 @@ impl StorageBackend for SqliteStorage {
             )
             .map_err(|e| CortexError::Storage(e.to_string()))?;
         let rows = stmt
-            .query_map(params![tier.as_str(), ns, limit as i64], Self::parse_mem_row)
+            .query_map(
+                params![tier.as_str(), ns, limit as i64],
+                Self::parse_mem_row,
+            )
             .map_err(|e| CortexError::Storage(e.to_string()))?;
         for row in rows {
             results.push(row.map_err(|e| CortexError::Storage(e.to_string()))?);
@@ -1649,13 +1755,17 @@ impl StorageBackend for SqliteStorage {
             conditions.join(" OR "),
             limit
         );
-        let mut stmt = conn.prepare(&sql).map_err(|e| CortexError::Storage(e.to_string()))?;
-        let mut params_vec: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::with_capacity(terms.len() + 1);
+        let mut stmt = conn
+            .prepare(&sql)
+            .map_err(|e| CortexError::Storage(e.to_string()))?;
+        let mut params_vec: Vec<Box<dyn rusqlite::types::ToSql>> =
+            Vec::with_capacity(terms.len() + 1);
         params_vec.push(Box::new("episodic".to_string()));
         for term in terms {
             params_vec.push(Box::new(format!("%{}%", term.to_lowercase())));
         }
-        let param_refs: Vec<&dyn rusqlite::types::ToSql> = params_vec.iter().map(|p| p.as_ref()).collect();
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+            params_vec.iter().map(|p| p.as_ref()).collect();
         let rows = stmt
             .query_map(param_refs.as_slice(), |row| {
                 let id_str: String = row.get(0)?;
@@ -1701,7 +1811,10 @@ impl StorageBackend for SqliteStorage {
             )
             .map_err(|e| CortexError::Storage(e.to_string()))?;
         let rows = stmt
-            .query_map(params![tier.as_str(), limit as i64, offset as i64], Self::parse_mem_row)
+            .query_map(
+                params![tier.as_str(), limit as i64, offset as i64],
+                Self::parse_mem_row,
+            )
             .map_err(|e| CortexError::Storage(e.to_string()))?;
         let mut results = Vec::new();
         for row in rows {
@@ -1710,10 +1823,7 @@ impl StorageBackend for SqliteStorage {
         Ok(results)
     }
 
-    fn batch_update_salience(
-        &self,
-        updates: &[(Uuid, String, f32)],
-    ) -> Result<usize, CortexError> {
+    fn batch_update_salience(&self, updates: &[(Uuid, String, f32)]) -> Result<usize, CortexError> {
         if updates.is_empty() {
             return Ok(0);
         }
@@ -1763,7 +1873,8 @@ impl StorageBackend for SqliteStorage {
                 .map_err(|e| CortexError::Storage(e.to_string()))?;
             for id in ids {
                 let id_str = id.to_string();
-                del_stmt.execute(params![id_str])
+                del_stmt
+                    .execute(params![id_str])
                     .map_err(|e| CortexError::Storage(e.to_string()))?;
                 count += 1;
             }
@@ -1832,7 +1943,7 @@ impl SqliteStorage {
         let mut min_rank = 0.0_f64;
         let mut max_rank = 0.0_f64;
         let mut raw: Vec<(Uuid, f64)> = Vec::new();
-        let mut seen_ids = std::collections::HashSet::new();  // Prevent duplicates across retries
+        let mut seen_ids = std::collections::HashSet::new(); // Prevent duplicates across retries
 
         // Progressive over-fetching: start with 10x multiplier, scale up if needed
         // This prevents result count from leaking privacy distribution info
@@ -2071,6 +2182,9 @@ mod row_parsing_tests {
 
         // Malformed JSON (e.g. a corrupted/tampered row) returns an Err, not a panic.
         let err = SqliteStorage::json_col::<Vec<String>>(8, "not valid json");
-        assert!(err.is_err(), "malformed JSON must map to an error, never panic");
+        assert!(
+            err.is_err(),
+            "malformed JSON must map to an error, never panic"
+        );
     }
 }

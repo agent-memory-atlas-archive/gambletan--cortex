@@ -64,6 +64,16 @@ jobs:
         run: |
           python -m pip install --force-reinstall dist/*.whl
           python -I "$GITHUB_WORKSPACE/cortex-python/tests/test_controlled_store.py"
+      - name: Reject writable foreign-owned database (real filesystem)
+        if: runner.os == 'Linux'
+        run: |
+          fixture_dir=$(mktemp -d)
+          chmod 755 "$fixture_dir"
+          fixture_path="$fixture_dir/foreign.db"
+          touch "$fixture_path"
+          sudo chown 65534:65534 "$fixture_path"
+          sudo chmod 666 "$fixture_path"
+          CORTEX_FOREIGN_OWNED_DB="$fixture_path" python -I "$GITHUB_WORKSPACE/cortex-python/tests/test_foreign_owned_database.py"
       - uses: actions/upload-artifact@v4
         with:
           name: controlled-wheel-${{ matrix.os }}

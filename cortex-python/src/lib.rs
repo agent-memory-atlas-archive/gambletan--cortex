@@ -176,43 +176,161 @@ fn invalid_controlled(py: Python<'_>) -> PyErr {
         cortex_core::controlled::ControlledError::InvalidInput("request"),
     )
 }
+fn bounded_value(
+    py: Python<'_>,
+    value: &Bound<'_, PyAny>,
+    depth: usize,
+    budget: &mut usize,
+    list_limit: usize,
+) -> PyResult<serde_json::Value> {
+    use pyo3::types::{PyBool, PyDict, PyFloat, PyInt, PyList, PyString};
+    let invalid = || invalid_controlled(py);
+    if depth > 8 {
+        return Err(invalid());
+    }
+    let debit = |budget: &mut usize, bytes: usize| -> PyResult<()> {
+        *budget = budget.checked_sub(bytes).ok_or_else(invalid)?;
+        Ok(())
+    };
+    debit(budget, 8)?;
+    if value.is_none() {
+        return Ok(serde_json::Value::Null);
+    }
+    if value.is_exact_instance_of::<PyBool>() {
+        return Ok(serde_json::Value::Bool(
+            value.extract().map_err(|_| invalid())?,
+        ));
+    }
+    if value.is_exact_instance_of::<PyInt>() {
+        return Ok(serde_json::Value::from(
+            value.extract::<i64>().map_err(|_| invalid())?,
+        ));
+    }
+    if value.is_exact_instance_of::<PyFloat>() {
+        let number = value.extract::<f64>().map_err(|_| invalid())?;
+        return serde_json::Number::from_f64(number)
+            .map(serde_json::Value::Number)
+            .ok_or_else(invalid);
+    }
+    if value.is_exact_instance_of::<PyString>() {
+        let string = value.downcast::<PyString>().map_err(|_| invalid())?;
+        // Check Python's character length before asking for a UTF-8 buffer.
+        if string.len().map_err(|_| invalid())? > 12000 {
+            return Err(invalid());
+        }
+        let text = string.to_str().map_err(|_| invalid())?;
+        if text.len() > 48000 {
+            return Err(invalid());
+        }
+        let bytes = text
+            .bytes()
+            .map(|b| {
+                if b < 32 {
+                    6
+                } else if b == b'"' || b == b'\\' {
+                    2
+                } else {
+                    1
+                }
+            })
+            .sum::<usize>();
+        debit(budget, bytes)?;
+        return Ok(serde_json::Value::String(text.to_owned()));
+    }
+    if value.is_exact_instance_of::<PyList>() {
+        let list = value.downcast::<PyList>().map_err(|_| invalid())?;
+        if list.len() > list_limit {
+            return Err(invalid());
+        }
+        debit(budget, list.len())?;
+        let mut result = Vec::with_capacity(list.len());
+        for item in list.iter() {
+            result.push(bounded_value(py, &item, depth + 1, budget, 100)?);
+        }
+        return Ok(serde_json::Value::Array(result));
+    }
+    if value.is_exact_instance_of::<PyDict>() {
+        let dict = value.downcast::<PyDict>().map_err(|_| invalid())?;
+        if dict.len() > 16 {
+            return Err(invalid());
+        }
+        let mut result = serde_json::Map::new();
+        for (key, item) in dict.iter() {
+            if !key.is_exact_instance_of::<PyString>() {
+                return Err(invalid());
+            }
+            let key = key.downcast::<PyString>().map_err(|_| invalid())?;
+            if key.len().map_err(|_| invalid())? > 64 {
+                return Err(invalid());
+            }
+            let key = key.to_str().map_err(|_| invalid())?;
+            if key.len() > 64 {
+                return Err(invalid());
+            }
+            debit(budget, key.len() * 6 + 3)?;
+            let cap = match key {
+                "embedding" => 4096,
+                "source_refs" => 16,
+                _ => 100,
+            };
+            result.insert(
+                key.to_owned(),
+                bounded_value(py, &item, depth + 1, budget, cap)?,
+            );
+        }
+        return Ok(serde_json::Value::Object(result));
+    }
+    Err(invalid())
+}
+fn parse_bounded<T: serde::de::DeserializeOwned>(
+    py: Python<'_>,
+    value: &Bound<'_, PyAny>,
+    cap: usize,
+) -> PyResult<T> {
+    let value = bounded_value(py, value, 0, &mut (8 * 1024 * 1024), cap)?;
+    serde_json::from_value(value).map_err(|_| invalid_controlled(py))
+}
 fn parse_controlled<T: serde::de::DeserializeOwned>(
     py: Python<'_>,
     value: &Bound<'_, PyAny>,
 ) -> PyResult<T> {
-    let body: String = (|| -> PyResult<_> {
-        py.import("json")?
-            .call_method1("dumps", (value,))?
-            .extract()
-    })()
-    .map_err(|_| invalid_controlled(py))?;
-    if body.len() > 8 * 1024 * 1024 {
-        return Err(invalid_controlled(py));
-    }
-    serde_json::from_str(&body).map_err(|_| invalid_controlled(py))
+    parse_bounded(py, value, 100)
 }
-fn controlled_result<T: serde::Serialize>(
+fn controlled_result<T: serde::Serialize + Send>(
     py: Python<'_>,
     value: Result<T, cortex_core::controlled::ControlledError>,
 ) -> PyResult<Py<PyAny>> {
     let value = value.map_err(|e| controlled_error(py, e))?;
-    let body = serde_json::to_string(&value).map_err(|_| invalid_controlled(py))?;
+    let body = py
+        .allow_threads(move || serde_json::to_string(&value))
+        .map_err(|_| invalid_controlled(py))?;
     Ok(py.import("json")?.call_method1("loads", (body,))?.unbind())
 }
 
 #[pyclass(name = "ControlledStore")]
 struct PyControlledStore {
+    creator_pid: u32,
     inner: parking_lot::Mutex<Option<std::sync::Arc<cortex_core::controlled::ControlledStore>>>,
 }
 impl PyControlledStore {
+    fn check_process(&self, py: Python<'_>) -> PyResult<()> {
+        if self.creator_pid != std::process::id() {
+            return Err(controlled_error(
+                py,
+                cortex_core::controlled::ControlledError::Conflict(
+                    "inherited handle; open after fork",
+                ),
+            ));
+        }
+        Ok(())
+    }
     fn handle(
         &self,
         py: Python<'_>,
     ) -> PyResult<std::sync::Arc<cortex_core::controlled::ControlledStore>> {
-        self.inner
-            .lock()
-            .clone()
-            .ok_or_else(|| controlled_error(py, cortex_core::controlled::ControlledError::Closed))
+        self.check_process(py)?;
+        let handle = { self.inner.lock().clone() };
+        handle.ok_or_else(|| controlled_error(py, cortex_core::controlled::ControlledError::Closed))
     }
 }
 #[pymethods]
@@ -220,12 +338,17 @@ impl PyControlledStore {
     #[new]
     fn new(
         py: Python<'_>,
-        root: String,
-        owner_type: String,
-        owner_id: String,
-        bot_id: String,
-        replica_id: String,
+        root: &Bound<'_, PyAny>,
+        owner_type: &Bound<'_, PyAny>,
+        owner_id: &Bound<'_, PyAny>,
+        bot_id: &Bound<'_, PyAny>,
+        replica_id: &Bound<'_, PyAny>,
     ) -> PyResult<Self> {
+        let root: String = parse_controlled(py, root)?;
+        let owner_type: String = parse_controlled(py, owner_type)?;
+        let owner_id: String = parse_controlled(py, owner_id)?;
+        let bot_id: String = parse_controlled(py, bot_id)?;
+        let replica_id: String = parse_controlled(py, replica_id)?;
         let identity = cortex_core::controlled::StoreIdentity {
             owner_type,
             owner_id,
@@ -241,6 +364,7 @@ impl PyControlledStore {
             })
             .map_err(|e| controlled_error(py, e))?;
         Ok(Self {
+            creator_pid: std::process::id(),
             inner: parking_lot::Mutex::new(Some(std::sync::Arc::new(store))),
         })
     }
@@ -261,11 +385,12 @@ impl PyControlledStore {
     fn reconcile(
         &self,
         py: Python<'_>,
-        generation: String,
+        generation: &Bound<'_, PyAny>,
         position: &Bound<'_, PyAny>,
     ) -> PyResult<Py<PyAny>> {
         let s = self.handle(py)?;
         let p = parse_controlled(py, position)?;
+        let generation: String = parse_controlled(py, generation)?;
         controlled_result(py, py.allow_threads(|| s.reconcile(&generation, p)))
     }
     fn apply_batch(
@@ -301,22 +426,32 @@ impl PyControlledStore {
         let p = parse_controlled(py, position)?;
         controlled_result(py, py.allow_threads(|| s.delete(m, p)))
     }
-    #[pyo3(signature = (query, allowed_scopes, limit=10, embedding=None, max_candidates=1000, max_duration_ms=250))]
-    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (query, allowed_scopes, **options))]
     fn search(
         &self,
         py: Python<'_>,
-        query: String,
+        query: &Bound<'_, PyAny>,
         allowed_scopes: &Bound<'_, PyAny>,
-        limit: i64,
-        embedding: Option<Vec<f32>>,
-        max_candidates: i64,
-        max_duration_ms: i64,
+        options: Option<&Bound<'_, pyo3::types::PyDict>>,
     ) -> PyResult<Py<PyAny>> {
         let s = self.handle(py)?;
-        let scopes: Vec<cortex_core::controlled::Scope> = parse_controlled(py, allowed_scopes)?;
-        if limit < 0 || max_candidates < 0 || max_duration_ms < 0 {
-            return Err(invalid_controlled(py));
+        let query: String = parse_controlled(py, query)?;
+        let scopes: Vec<cortex_core::controlled::Scope> = parse_bounded(py, allowed_scopes, 64)?;
+        let mut limit: usize = 10;
+        let mut embedding: Option<Vec<f32>> = None;
+        let mut max_candidates: usize = 1000;
+        let mut max_duration_ms: u64 = 250;
+        if let Some(options) = options {
+            for (key, value) in options.iter() {
+                let key: String = parse_controlled(py, &key)?;
+                match key.as_str() {
+                    "limit" => limit = parse_controlled(py, &value)?,
+                    "embedding" => embedding = parse_bounded(py, &value, 4096)?,
+                    "max_candidates" => max_candidates = parse_controlled(py, &value)?,
+                    "max_duration_ms" => max_duration_ms = parse_controlled(py, &value)?,
+                    _ => return Err(invalid_controlled(py)),
+                }
+            }
         }
         controlled_result(
             py,
@@ -325,24 +460,31 @@ impl PyControlledStore {
                     &query,
                     &scopes,
                     cortex_core::controlled::SearchOptions {
-                        limit: limit as usize,
+                        limit,
                         embedding,
-                        max_candidates: max_candidates as usize,
-                        max_duration_ms: max_duration_ms as u64,
+                        max_candidates,
+                        max_duration_ms,
                     },
                 )
             }),
         )
     }
+    fn retry_cleanup(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let s = self.handle(py)?;
+        controlled_result(py, py.allow_threads(|| s.retry_cleanup()))
+    }
     fn close(&self, py: Python<'_>) -> PyResult<()> {
-        let s = self.inner.lock().take().ok_or_else(|| {
+        self.check_process(py)?;
+        let handle = { self.inner.lock().take() };
+        let s = handle.ok_or_else(|| {
             controlled_error(py, cortex_core::controlled::ControlledError::Closed)
         })?;
         py.allow_threads(move || {
-            s.close();
+            let result = s.close();
             drop(s);
-        });
-        Ok(())
+            result
+        })
+        .map_err(|e| controlled_error(py, e))
     }
 }
 

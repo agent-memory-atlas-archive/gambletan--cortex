@@ -512,6 +512,212 @@ class ControlledStoreAcceptance(unittest.TestCase):
                 finally:
                     self.root = original_root
 
+    def test_cleanup_pending_with_readonly_reader_then_retry_and_reopen(self):
+        store = self.ready([projection()])
+        self.assertIsInstance(store.status()["cleanup_pending"], bool)
+        databases = []
+        for path in Path(self.root).rglob("*.db"):
+            with path.open("rb") as handle:
+                if handle.read(16) == b"SQLite format 3\x00":
+                    databases.append(path)
+        self.assertEqual(len(databases), 1)
+        blocker = r'''
+import sqlite3, sys
+connection = sqlite3.connect(sys.argv[1] + '?mode=ro', uri=True)
+connection.execute('BEGIN')
+connection.execute('SELECT count(*) FROM sqlite_master').fetchone()
+print('ready', flush=True)
+sys.stdin.readline()
+connection.close()
+'''
+        reader = subprocess.Popen([sys.executable, "-I", "-c", blocker, databases[0].as_uri()],
+                                  stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                  stderr=subprocess.PIPE, text=True)
+        self.children.append(reader)
+        ready_lines = queue.Queue()
+        threading.Thread(target=lambda: ready_lines.put(reader.stdout.readline()), daemon=True).start()
+        self.assertEqual(ready_lines.get(timeout=10).strip(), "ready")
+        try:
+            receipt = store.upsert(projection(revision=2, text="orchid replacement"), 101)
+            self.assertTrue(receipt["durable"])
+            self.assertTrue(store.status()["cleanup_pending"])
+            begin = time.monotonic()
+            self.assertTrue(store.retry_cleanup()["cleanup_pending"])
+            self.assertLess(time.monotonic() - begin, 5.0)
+            withdrawn = store.delete(deletion(revision=3), 102)
+            self.assertTrue(withdrawn["durable"])
+            self.assertTrue(store.status()["cleanup_pending"])
+            self.assertEqual(self.hits(store), [])
+        finally:
+            reader.communicate(input="release\n", timeout=10)
+            self.assertEqual(reader.returncode, 0)
+        begin = time.monotonic()
+        self.assertFalse(store.retry_cleanup()["cleanup_pending"])
+        self.assertLess(time.monotonic() - begin, 5.0)
+        self.assertEqual(store.delete(deletion(revision=3), 102), withdrawn)
+        store.close()
+        reopened = self.open()
+        self.assertFalse(reopened.status()["cleanup_pending"])
+        self.reconcile(reopened)
+        self.assertEqual(self.hits(reopened), [])
+
+    def test_search_malformed_options_builtin_only_and_unicode(self):
+        store = self.ready([projection(text="İabout 猫 orchid")])
+        result = store.search("İabout 猫", [SCOPE])
+        self.assertIsInstance(result["hits"], list)
+        with self.assertRaises(TypeError):
+            store.search("orchid", [SCOPE], 10)
+        for name in ("limit", "max_candidates", "max_duration_ms"):
+            for value in (True, False, "10", None, 1.5, 2**100, -1, [], {}):
+                with self.subTest(option=name, value_type=type(value).__name__):
+                    self.error("invalid_input", store.search, "orchid", [SCOPE], **{name: value})
+        for vector in (True, "vector", [True], [1e308], [1.0, object()]):
+            self.error("invalid_input", store.search, "orchid", [SCOPE], embedding=vector)
+        self.error("invalid_input", store.search, " ".join("term%d" % i for i in range(65)), [SCOPE])
+        class Custom:
+            pass
+        class DictSubclass(dict):
+            pass
+        class ListSubclass(list):
+            pass
+        class StringSubclass(str):
+            pass
+        class IntSubclass(int):
+            pass
+        for value in (Custom(), DictSubclass(projection()),
+                      projection(text=StringSubclass("orchid")), projection(revision=IntSubclass(2))):
+            self.error("invalid_input", store.upsert, value, 101)
+        self.error("invalid_input", store.seed, ListSubclass([projection("new")]))
+        cyclic = []
+        cyclic.append(cyclic)
+        self.error("invalid_input", store.seed, cyclic)
+        deep = []
+        for _ in range(12):
+            deep = [deep]
+        self.error("invalid_input", store.seed, deep)
+        self.error("invalid_input", store.upsert, projection(text="x"*(8*1024*1024+1)), 101)
+        duplicate = projection("duplicate")
+        self.error("invalid_input", store.apply_batch, [upsert(duplicate), upsert(duplicate)], 101)
+        self.assertEqual(store.status()["position"], 100)
+
+    def test_exact_submillisecond_interval_and_clock_filter(self):
+        start = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=0.15)
+        until = start + datetime.timedelta(microseconds=200)
+        item = projection("precise", valid_from=start.isoformat(), valid_until=until.isoformat())
+        store = self.ready([item])
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            before = datetime.datetime.now(datetime.timezone.utc)
+            hits = self.hits(store)
+            after = datetime.datetime.now(datetime.timezone.utc)
+            for hit in hits:
+                self.assertEqual(datetime.datetime.fromisoformat(hit["valid_from"].replace("Z", "+00:00")), start)
+                self.assertEqual(datetime.datetime.fromisoformat(hit["valid_until"].replace("Z", "+00:00")), until)
+                self.assertLess(before, until, "expired submillisecond candidate returned")
+                self.assertGreaterEqual(after, start, "future submillisecond candidate returned")
+            if before > until + datetime.timedelta(milliseconds=5):
+                self.assertEqual(hits, [])
+                break
+        else:
+            self.fail("precise interval test failed to reach its expiry checkpoint")
+        # Distinct bounds inside one millisecond must remain a valid interval.
+        tiny = projection("nanosecond", valid_from="2000-01-01T00:00:00.000000001Z",
+                          valid_until="2000-01-01T00:00:00.000000002Z")
+        store.upsert(tiny, 101)
+        self.assertEqual(self.hits(store), [])
+
+    def test_unsafe_nonsticky_ancestor_rejected(self):
+        ancestor = Path(self.temp.name).resolve() / "unsafe-parent"
+        ancestor.mkdir(mode=0o700)
+        try:
+            for mode in (0o770, 0o707, 0o777):
+                ancestor.chmod(mode)
+                self.error("invalid_input", self.open, root=str(ancestor / "private"))
+        finally:
+            ancestor.chmod(0o700)
+
+    def test_fork_inherited_handle_fails_before_copied_locks(self):
+        script = r'''
+import json, os, signal, sys
+from cortex_ai_memory import ControlledStore, ControlledError
+s = ControlledStore(sys.argv[1], 'merchant', 'merchant-acceptance', 'bot-one', 'replica-one')
+s.finish_snapshot(100)
+s.reconcile(s.status()['generation'], 100)
+r, w = os.pipe()
+pid = os.fork()
+if pid == 0:
+    signal.alarm(5)
+    os.close(r)
+    codes = []
+    try:
+        for call in (s.status, lambda:s.search('orchid', []), s.retry_cleanup, s.close):
+            try:
+                call()
+                codes.append('unexpected-success')
+            except ControlledError as e:
+                codes.append(e.code)
+        os.write(w, json.dumps(codes).encode())
+    finally:
+        os._exit(0)
+os.close(w)
+data = os.read(r, 65536)
+os.waitpid(pid, 0)
+print(data.decode(), flush=True)
+s.close()
+'''
+        completed = subprocess.run([sys.executable, "-I", "-c", script, self.root],
+                                   capture_output=True, text=True, timeout=15)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(json.loads(completed.stdout), ["conflict"]*4)
+        reopened = self.open()
+        self.reconcile(reopened)
+
+    def test_immediate_reopen_while_old_thread_calls_are_queued(self):
+        store = self.ready([projection()])
+        barrier = threading.Barrier(9)
+        def caller():
+            barrier.wait(timeout=10)
+            for _ in range(100):
+                try:
+                    store.search("orchid", [SCOPE])
+                except ControlledError as error:
+                    self.assertEqual(error.code, "closed")
+                    return
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+            futures = [pool.submit(caller) for _ in range(8)]
+            barrier.wait(timeout=10)
+            store.close()
+            # Reopen before waiting for old Python callers to finish: none may
+            # reacquire ownership or touch the newly opened generation.
+            reopened = self.open()
+            self.reconcile(reopened)
+            reopened.upsert(projection(revision=2, text="orchid reopened"), 101)
+            for future in futures:
+                future.result(timeout=15)
+            self.assertEqual(self.hits(reopened)[0]["text"], "orchid reopened")
+
+    def test_unauthorized_term_load_cannot_change_authorized_ranking(self):
+        allowed = [projection("allowed-exact", text="orchid orchid report", embedding=[1.0, 0.0]),
+                   projection("allowed-other", text="orchid other report", embedding=[0.0, 1.0])]
+        store = self.open()
+        store.seed(allowed)
+        store.finish_snapshot(100)
+        self.reconcile(store)
+        baseline = store.search("orchid report", [SCOPE], limit=2, max_candidates=2, embedding=[1.0, 0.0])
+        signature = [(hit["memory_id"], hit["score"]) for hit in baseline["hits"]]
+        self.assertEqual({key for key, _ in signature}, {"allowed-exact", "allowed-other"})
+        position = 100
+        for offset in range(0, 1500, 100):
+            position += 1
+            store.apply_batch([upsert(projection("excluded-load-%d" % i, scope=OTHER,
+                                                 text="orchid "*30 + "report"))
+                               for i in range(offset, offset+100)], position)
+        for _ in range(3):
+            result = store.search("orchid report", [SCOPE], limit=2, max_candidates=2, embedding=[1.0, 0.0])
+            self.assertEqual([(hit["memory_id"], hit["score"]) for hit in result["hits"]], signature)
+            self.assertEqual(result["degraded"], baseline["degraded"])
+            self.assertEqual(result["truncated"], baseline["truncated"])
+
     def test_restored_local_transaction_loss_rejects_remote_cursor(self):
         store = self.ready([projection()])
         state = store.status()
