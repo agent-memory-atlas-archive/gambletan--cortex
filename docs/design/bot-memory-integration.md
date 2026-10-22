@@ -13,7 +13,7 @@ The upstream Bot contract is [kol-agent PR #24](https://github.com/HEchooo/kol-a
 - ContextProjector remains the sole model-context composer. Raw Cortex `get_context()` output is not injected alongside it.
 - Workflow retains runs, checkpoints, approvals, actions, budget barriers, and recovery. Cortex receives no wallet, publishing, or execution authority.
 - A local revision is an object concurrency token, not a cross-repository version/hash admission rule. No shared ORM or writes to another service's database.
-- Existing personal Cortex, MCP, HTTP, sync, gateway, and cloud behavior remains compatible. The new integration uses a separate controlled store and explicit opt-in; personal archives and Muse exports are never imported implicitly.
+- Existing personal Cortex, MCP, HTTP, sync, gateway, and cloud API signatures remain compatible. Private-file enforcement now rejects unsupported SQLite URI names and unsafe filesystem aliases as described in the API contract. The new integration uses a separate controlled store and explicit opt-in; personal archives and Muse exports are never imported implicitly.
 
 ## 2. Evidence and reuse at the planning baseline
 
@@ -81,7 +81,7 @@ Use a dedicated database per owner/bot and per serving-process replica. Derive p
 
 Persist a controlled-store marker. New legacy open/export/sync paths must refuse a marked controlled store, and controlled open refuses a personal store; do not rely only on caller discipline. The controlled binding exposes no general core/storage handle, legacy mutation, export, sync, or plugin access. Older binaries cannot honor a new marker, so deployment paths/access policy and rollback prohibit opening the controlled files with them.
 
-Each replica has its own persistent replay cursor and instance ID; do not use a shared work-queue acknowledgement as proof that every replica has applied an event. P0 supports independent local replicas, not multiple processes sharing one index database. Enforce one live controlled handle per database with an in-process registry and an OS-released-on-exit lock; a second process fails with an explicit busy result. This does not replace SQLite locks or imply a distributed lease.
+Each replica has its own persistent replay cursor and instance ID; do not use a shared work-queue acknowledgement as proof that every replica has applied an event. P0 supports independent local replicas, not multiple processes sharing one index database. Enforce one live controlled handle per database with an OS-released-on-exit file lock, including duplicate opens within one process; another handle or process fails with an explicit busy result. This does not replace SQLite locks or imply a distributed lease.
 
 The Bot adapter manages replay for each replica. A new/lost replica builds from current PostgreSQL state; an expired replay cursor forces rebuild. A paused or lagging replica may serve only results that survive current authoritative revalidation, otherwise the Bot uses its PostgreSQL fallback. Record bounded lag and recovery state without memory text.
 
@@ -109,7 +109,7 @@ Logical withdrawal and physical erasure are distinct: no immediate wiping of exi
 
 ## 5. Python delivery and operational fallback (P0)
 
-The Python `ControlledStore` binding exposes open/seed/finish_snapshot/reconcile/apply_batch/upsert/delete/search/status/close; exact dictionary schemas and limits are in the [API contract](../controlled-memory-api.md). Errors distinguish invalid scope/input, stale revision, equal-revision conflict, busy/not-ready store, and bounded retrieval degradation. Search results must not require parsing a generated prompt or tuple text to recover identity.
+The Python `ControlledStore` binding exposes open/seed/finish_snapshot/reconcile/apply_batch/upsert/delete/search/status/retry_cleanup/close; exact dictionary schemas and limits are in the [API contract](../controlled-memory-api.md). Errors distinguish invalid scope/input, stale revision, equal-revision conflict, busy/not-ready store, and bounded retrieval degradation. Search results must not require parsing a generated prompt or tuple text to recover identity.
 
 P0 runtime uses a supported wheel installed in a clean environment, not an adjacent Rust checkout. Add a built-wheel smoke/integration test covering import/class name, controlled APIs, restart, and scope/delete behavior. Rust workspace CI excludes cortex-python and therefore cannot substitute for this test. Verify the host's actual Python, OS, and architecture; add the binding job to the required integration checks rather than treating a skipped release workflow as acceptance. Coordinate macOS fixes with PR #14.
 
