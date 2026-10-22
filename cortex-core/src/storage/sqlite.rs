@@ -183,6 +183,10 @@ impl SqliteStorage {
     }
     #[cfg(unix)]
     fn restrict_db_file_mode(path: &str) -> Result<String, CortexError> {
+        Self::restrict_db_file_mode_with_hook(path, |_| {})
+    }
+    #[cfg(unix)]
+    fn restrict_db_file_mode_with_hook(path: &str, mut after_metadata: impl FnMut(&std::path::Path)) -> Result<String, CortexError> {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
         if path == ":memory:" { return Ok(path.to_owned()); }
         if path.is_empty() || path.starts_with("file:") {
@@ -218,22 +222,42 @@ impl SqliteStorage {
             let artifact = if suffix.is_empty() { resolved.clone() } else {
                 let mut name = resolved.as_os_str().to_os_string(); name.push(suffix); std::path::PathBuf::from(name)
             };
-            let before = match std::fs::symlink_metadata(&artifact) {
-                Err(e) if !suffix.is_empty() && e.kind() == std::io::ErrorKind::NotFound => continue,
-                other => other.map_err(|e| CortexError::Storage(e.to_string()))?,
-            };
-            if !before.is_file() || before.uid() != unsafe { libc::geteuid() } || before.nlink() != 1 {
-                return Err(CortexError::Storage("database must be an owner-owned regular file".into()));
+            let optional = !suffix.is_empty();
+            let mut validated = false;
+            for _ in 0..4 {
+                let before = match std::fs::symlink_metadata(&artifact) {
+                    Err(e) if optional && e.kind() == std::io::ErrorKind::NotFound => { validated = true; break; }
+                    other => other.map_err(|e| CortexError::Storage(e.to_string()))?,
+                };
+                if !before.is_file() || before.uid() != unsafe { libc::geteuid() } || before.nlink() != 1 {
+                    return Err(CortexError::Storage("database must be an owner-owned regular file".into()));
+                }
+                after_metadata(&artifact);
+                // SQLite can remove/recreate optional sidecars as connections close.
+                // Revalidate pathname metadata; never open/close their descriptors.
+                match std::fs::set_permissions(&artifact, std::fs::Permissions::from_mode(0o600)) {
+                    Err(e) if optional && e.kind() == std::io::ErrorKind::NotFound => continue,
+                    other => other.map_err(|e| CortexError::Storage(e.to_string()))?,
+                }
+                let after = match std::fs::symlink_metadata(&artifact) {
+                    Err(e) if optional && e.kind() == std::io::ErrorKind::NotFound => continue,
+                    other => other.map_err(|e| CortexError::Storage(e.to_string()))?,
+                };
+                if !after.is_file() || before.uid() != after.uid() || after.nlink() != 1 {
+                    return Err(CortexError::Storage("database file changed or is not private".into()));
+                }
+                if before.dev() != after.dev() || before.ino() != after.ino() {
+                    if optional { continue; }
+                    return Err(CortexError::Storage("database file changed".into()));
+                }
+                if after.permissions().mode() & 0o777 != 0o600 {
+                    return Err(CortexError::Storage("database file is not private".into()));
+                }
+                validated = true;
+                break;
             }
-            // Safe under the verified, non-replaceable directory chain and the
-            // file's verified owner. No unrelated descriptors are opened/closed.
-            std::fs::set_permissions(&artifact, std::fs::Permissions::from_mode(0o600))
-                .map_err(|e| CortexError::Storage(e.to_string()))?;
-            let after = std::fs::symlink_metadata(&artifact).map_err(|e| CortexError::Storage(e.to_string()))?;
-            if !after.is_file() || before.dev() != after.dev() || before.ino() != after.ino()
-                || before.uid() != after.uid() || after.nlink() != 1 || after.permissions().mode() & 0o777 != 0o600 {
-                return Err(CortexError::Storage("database file changed or is not private".into()));
-            }
+            if !validated { return Err(CortexError::Storage("database sidecar kept changing".into())); }
+
         }
         resolved.to_str().map(str::to_owned).ok_or_else(|| CortexError::InvalidInput("database path encoding".into()))
     }
@@ -378,11 +402,17 @@ impl SqliteStorage {
     }
 
     fn initialize_privacy_maintenance(&self, had_memories: bool) -> Result<(), CortexError> {
-        let conn = self.write_conn.lock();
-        conn.execute_batch("CREATE TABLE IF NOT EXISTS cortex_privacy_maintenance(id INTEGER PRIMARY KEY CHECK(id=1), erasure_version INTEGER NOT NULL, cleanup_pending INTEGER NOT NULL);")
+        let mut conn = self.write_conn.lock();
+        // Serialize schema upgrades across personal-store handles/processes.
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(|e| CortexError::Storage(e.to_string()))?;
+        tx.execute_batch("CREATE TABLE IF NOT EXISTS cortex_privacy_maintenance(id INTEGER PRIMARY KEY CHECK(id=1), erasure_version INTEGER NOT NULL, cleanup_pending INTEGER NOT NULL, cleanup_token TEXT NOT NULL DEFAULT '');")
             .map_err(|e| CortexError::Storage(e.to_string()))?;
-        conn.execute("INSERT OR IGNORE INTO cortex_privacy_maintenance(id,erasure_version,cleanup_pending) VALUES(1,?1,?2)", params![if had_memories { 0 } else { 1 }, had_memories])
+        let has_token: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('cortex_privacy_maintenance') WHERE name='cleanup_token')", [], |r|r.get(0))
             .map_err(|e| CortexError::Storage(e.to_string()))?;
+        if !has_token { tx.execute_batch("ALTER TABLE cortex_privacy_maintenance ADD COLUMN cleanup_token TEXT NOT NULL DEFAULT '';").map_err(|e| CortexError::Storage(e.to_string()))?; }
+        tx.execute("INSERT OR IGNORE INTO cortex_privacy_maintenance(id,erasure_version,cleanup_pending) VALUES(1,?1,?2)", params![if had_memories { 0 } else { 1 }, had_memories])
+            .map_err(|e| CortexError::Storage(e.to_string()))?;
+        tx.commit().map_err(|e| CortexError::Storage(e.to_string()))?;
         // Version zero is itself pending even if a previous process crashed.
         let pending = Self::retry_personal_cleanup_on_connection(&conn)?;
         let version: i64 = conn.query_row("SELECT erasure_version FROM cortex_privacy_maintenance WHERE id=1", [], |r| r.get(0)).map_err(|e| CortexError::Storage(e.to_string()))?;
@@ -402,7 +432,10 @@ impl SqliteStorage {
         Self::retry_personal_cleanup_on_connection(&self.write_conn.lock())
     }
     fn retry_personal_cleanup_on_connection(conn: &Connection) -> Result<bool, CortexError> {
-        let (version, pending): (i64,bool) = conn.query_row("SELECT erasure_version,cleanup_pending FROM cortex_privacy_maintenance WHERE id=1", [], |r| Ok((r.get(0)?,r.get(1)?)))
+        Self::retry_personal_cleanup_with_hook(conn, || {})
+    }
+    fn retry_personal_cleanup_with_hook(conn: &Connection, after_checkpoint: impl FnOnce()) -> Result<bool, CortexError> {
+        let (version, pending, token): (i64,bool,String) = conn.query_row("SELECT erasure_version,cleanup_pending,cleanup_token FROM cortex_privacy_maintenance WHERE id=1", [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)))
             .map_err(|e| CortexError::Storage(e.to_string()))?;
         if version != 0 && !pending { return Ok(false); }
         if version == 0 {
@@ -424,9 +457,13 @@ impl SqliteStorage {
             return migrated.map(|done| !done).map_err(|e| CortexError::Storage(e.to_string()));
         }
         if Self::scrub_after_delete(conn) {
-            conn.execute("UPDATE cortex_privacy_maintenance SET cleanup_pending=0 WHERE id=1", [])
+            after_checkpoint();
+            // A newer delete can commit between checkpoint and flag publication.
+            // UUID tokens never return to an older value (including after a clear).
+            conn.execute("UPDATE cortex_privacy_maintenance SET cleanup_pending=0 WHERE id=1 AND cleanup_token=?1", [token])
                 .map_err(|e| CortexError::Storage(e.to_string()))?;
-            return Ok(false);
+            return conn.query_row("SELECT cleanup_pending OR erasure_version=0 FROM cortex_privacy_maintenance WHERE id=1", [], |r|r.get(0))
+                .map_err(|e| CortexError::Storage(e.to_string()));
         }
         Ok(true)
     }
@@ -1086,7 +1123,7 @@ impl StorageBackend for SqliteStorage {
         let conn = self.write_conn.lock();
         let tx = conn.unchecked_transaction().map_err(|e| CortexError::Storage(e.to_string()))?;
         tx.execute("DELETE FROM memories WHERE id=?1", [id.to_string()]).map_err(|e| CortexError::Storage(e.to_string()))?;
-        tx.execute("UPDATE cortex_privacy_maintenance SET cleanup_pending=1 WHERE id=1", []).map_err(|e| CortexError::Storage(e.to_string()))?;
+        tx.execute("UPDATE cortex_privacy_maintenance SET cleanup_pending=1,cleanup_token=?1 WHERE id=1", [Uuid::new_v4().to_string()]).map_err(|e| CortexError::Storage(e.to_string()))?;
         tx.commit().map_err(|e| CortexError::Storage(e.to_string()))?;
         self.cache_evict(&id);
         // Logical deletion is committed. Preserve its success and expose physical
@@ -1960,12 +1997,11 @@ impl StorageBackend for SqliteStorage {
             return Ok(0);
         }
         let conn = self.write_conn.lock();
-        conn.execute_batch("BEGIN TRANSACTION;")
-            .map_err(|e| CortexError::Storage(e.to_string()))?;
+        let tx = conn.unchecked_transaction().map_err(|e| CortexError::Storage(e.to_string()))?;
 
         let mut count = 0;
         {
-            let mut del_stmt = conn
+            let mut del_stmt = tx
                 .prepare_cached("DELETE FROM memories WHERE id = ?1")
                 .map_err(|e| CortexError::Storage(e.to_string()))?;
             for id in ids {
@@ -1978,8 +2014,8 @@ impl StorageBackend for SqliteStorage {
         }
         // FTS5 synced via trigger (memories_fts_ad)
 
-        conn.execute("UPDATE cortex_privacy_maintenance SET cleanup_pending=1 WHERE id=1", []).map_err(|e| CortexError::Storage(e.to_string()))?;
-        conn.execute_batch("COMMIT;")
+        tx.execute("UPDATE cortex_privacy_maintenance SET cleanup_pending=1,cleanup_token=?1 WHERE id=1", [Uuid::new_v4().to_string()]).map_err(|e| CortexError::Storage(e.to_string()))?;
+        tx.commit()
             .map_err(|e| CortexError::Storage(e.to_string()))?;
         if count > 0 && Self::retry_personal_cleanup_on_connection(&conn).is_err() { tracing::warn!("SQLite physical cleanup remains pending after logical deletion"); }
         // Evict deleted entries from cache
@@ -2282,5 +2318,112 @@ mod row_parsing_tests {
             err.is_err(),
             "malformed JSON must map to an error, never panic"
         );
+    }
+}
+
+#[cfg(test)]
+mod privacy_cleanup_tests {
+    use super::*;
+    use crate::storage::traits::StorageBackend;
+    use crate::types::{MemContent, MemObjectBuilder, MemSource, MemoryTier};
+    fn memory(text: &str) -> MemObject {
+        MemObjectBuilder::new(MemoryTier::Episodic, MemContent::Text(text.into()), MemSource::new("test")).build()
+    }
+    #[test]
+    fn stale_cleanup_cannot_clear_a_newer_instances_delete() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().canonicalize().unwrap().join("race.db");
+        let first = SqliteStorage::open(path.to_str().unwrap()).unwrap();
+        let second = SqliteStorage::open(path.to_str().unwrap()).unwrap();
+        let marker = "ZQXCLEANUPNEWERDELETEDPRIVATE";
+        let record = memory(marker);
+        first.store_memory(&record).unwrap();
+        first.write_conn.lock().execute("UPDATE cortex_privacy_maintenance SET cleanup_pending=1", []).unwrap();
+        let reader = Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        let conn = first.write_conn.lock();
+        let pending = SqliteStorage::retry_personal_cleanup_with_hook(&conn, || {
+            reader.execute_batch("BEGIN;").unwrap();
+            reader.query_row("SELECT COUNT(*) FROM memories", [], |r|r.get::<_,i64>(0)).unwrap();
+            second.delete_memory(record.id).unwrap();
+            assert!(second.cleanup_pending().unwrap());
+        }).unwrap();
+        assert!(pending, "older checkpoint must not clear a newer deletion");
+        drop(conn);
+        assert!(first.cleanup_pending().unwrap());
+        let contains = |p: &std::path::Path| std::fs::read(p).unwrap_or_default().windows(marker.len()).any(|w|w.eq_ignore_ascii_case(marker.as_bytes()));
+        assert!(contains(&path) || contains(&std::path::PathBuf::from(format!("{}-wal",path.display()))));
+        reader.execute_batch("ROLLBACK;").unwrap();
+        drop(reader);
+        assert!(!first.retry_cleanup().unwrap());
+        assert!(!second.cleanup_pending().unwrap());
+        assert!(!contains(&path));
+        assert!(!contains(&std::path::PathBuf::from(format!("{}-wal",path.display()))));
+    }
+    #[test]
+    fn existing_maintenance_table_acquires_cleanup_tokens_on_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().canonicalize().unwrap().join("upgrade-token.db");
+        drop(SqliteStorage::open(path.to_str().unwrap()).unwrap());
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("DROP TABLE cortex_privacy_maintenance;
+            CREATE TABLE cortex_privacy_maintenance(id INTEGER PRIMARY KEY,erasure_version INTEGER NOT NULL,cleanup_pending INTEGER NOT NULL);
+            INSERT INTO cortex_privacy_maintenance VALUES(1,1,1);").unwrap();
+        drop(conn);
+        let storage = SqliteStorage::open(path.to_str().unwrap()).unwrap();
+        assert!(!storage.cleanup_pending().unwrap());
+        assert_eq!(storage.write_conn.lock().query_row("SELECT cleanup_token FROM cortex_privacy_maintenance", [], |r|r.get::<_,String>(0)).unwrap(), "");
+        let record = memory("new deletion gets persistent token");
+        storage.store_memory(&record).unwrap();
+        storage.delete_memory(record.id).unwrap();
+        let token: String = storage.write_conn.lock().query_row("SELECT cleanup_token FROM cortex_privacy_maintenance", [], |r|r.get(0)).unwrap();
+        assert!(Uuid::parse_str(&token).is_ok());
+    }
+    #[cfg(unix)]
+    #[test]
+    fn optional_sidecar_disappearance_and_replacement_are_revalidated() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().canonicalize().unwrap().join("sidecar.db");
+        let storage = SqliteStorage::open(path.to_str().unwrap()).unwrap();
+        drop(storage);
+        let wal = std::path::PathBuf::from(format!("{}-wal", path.display()));
+        for replace in [false,true] {
+            std::fs::write(&wal,b"temporary sidecar").unwrap();
+            let mut injected = false;
+            let result = SqliteStorage::restrict_db_file_mode_with_hook(path.to_str().unwrap(), |artifact| {
+                if artifact == wal && !injected {
+                    injected = true;
+                    std::fs::remove_file(&wal).unwrap();
+                    if replace { std::fs::write(&wal,b"replacement sidecar").unwrap(); }
+                }
+            });
+            assert!(injected);
+            result.unwrap();
+            if wal.exists() { std::fs::remove_file(&wal).unwrap(); }
+        }
+    }
+    #[test]
+    fn batch_maintenance_failure_rolls_back_rows_cache_and_transaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().canonicalize().unwrap().join("batch.db");
+        let storage = SqliteStorage::open(path.to_str().unwrap()).unwrap();
+        let record = memory("original cached private memory");
+        storage.store_memory(&record).unwrap();
+        assert!(storage.get_memory(record.id).unwrap().is_some());
+        storage.write_conn.lock().execute_batch("CREATE TRIGGER fail_cleanup_state BEFORE UPDATE ON cortex_privacy_maintenance BEGIN SELECT RAISE(ABORT,'injected maintenance failure'); END;").unwrap();
+        assert!(storage.delete_memories_batch(&[record.id]).is_err());
+        assert!(storage.write_conn.lock().is_autocommit(), "failed batch leaked its transaction");
+        let other = Connection::open(&path).unwrap();
+        other.busy_timeout(std::time::Duration::from_millis(100)).unwrap();
+        other.execute_batch("BEGIN IMMEDIATE; ROLLBACK;").unwrap();
+        assert_eq!(other.query_row("SELECT COUNT(*) FROM memories WHERE id=?1", [record.id.to_string()], |r| r.get::<_, i64>(0)).unwrap(),1);
+        assert!(storage.get_memory(record.id).unwrap().is_some());
+        assert!(!storage.cleanup_pending().unwrap());
+        storage.write_conn.lock().execute_batch("DROP TRIGGER fail_cleanup_state;").unwrap();
+        let next = memory("subsequent write commits independently");
+        storage.store_memory(&next).unwrap();
+        assert_eq!(other.query_row("SELECT COUNT(*) FROM memories", [], |r|r.get::<_,i64>(0)).unwrap(),2);
+        storage.delete_memories_batch(&[record.id,next.id]).unwrap();
+        assert!(storage.get_memory(record.id).unwrap().is_none());
+        assert!(storage.get_memory(next.id).unwrap().is_none());
     }
 }

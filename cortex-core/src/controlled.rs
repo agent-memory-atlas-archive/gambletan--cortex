@@ -438,12 +438,8 @@ impl ControlledStore {
         let lease = ReplicaLease::acquire(&path)?;
         let file = private_file(&path.with_extension("lock"))?;
         lock_replica(&file)?;
-        for suffix in ["", "-wal", "-shm", "-journal"] {
-            let p = PathBuf::from(format!("{}{suffix}", path.display()));
-            if suffix.is_empty() || p.exists() || std::fs::symlink_metadata(&p).is_ok() {
-                drop(private_file(&p)?);
-            }
-        }
+        // SqliteStorage validates/prepares artifacts without opening unrelated
+        // descriptors; closing an existing SHM FD would release process WAL locks.
         let storage = SqliteStorage::open_controlled(
             path.to_str()
                 .ok_or(ControlledError::InvalidInput("path encoding"))?,
@@ -1316,6 +1312,25 @@ mod tests {
                 conn.execute_batch("BEGIN IMMEDIATE;")?;
                 probe_writer(&path, true);
                 assert!(SqliteStorage::open(path.to_str().unwrap()).is_err());
+                probe_writer(&path, true);
+                conn.execute_batch("ROLLBACK;")?;
+                Ok(())
+            })
+            .unwrap();
+        probe_writer(&path, false);
+    }
+    #[test]
+    fn rejecting_personal_file_at_controlled_path_preserves_its_writer_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap().join("private");
+        prepare_root(&root, |_| {}).unwrap();
+        let path = root.join(format!("{}.db", digest(&identity()).unwrap()));
+        let personal = SqliteStorage::open(path.to_str().unwrap()).unwrap();
+        personal
+            .with_controlled_conn(|conn| -> Result<()> {
+                conn.execute_batch("BEGIN IMMEDIATE;")?;
+                probe_writer(&path, true);
+                assert!(ControlledStore::open(&root, identity()).is_err());
                 probe_writer(&path, true);
                 conn.execute_batch("ROLLBACK;")?;
                 Ok(())

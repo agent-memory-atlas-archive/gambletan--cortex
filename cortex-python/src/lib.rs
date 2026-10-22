@@ -292,6 +292,38 @@ fn bounded_value(
     }
     Err(invalid())
 }
+// Object positions follow the public dictionary schema. Serde struct decoding
+// alone also accepts positional arrays, which are not part of this Python API.
+fn controlled_object_shape(value: &serde_json::Value) -> bool {
+    value.as_object().is_some_and(|fields| {
+        fields.iter().all(|(key, value)| match key.as_str() {
+            "scope" | "projection" | "deletion" => controlled_object_shape(value),
+            "source_refs" => value
+                .as_array()
+                .is_some_and(|items| items.iter().all(controlled_object_shape)),
+            _ => true,
+        })
+    })
+}
+fn parse_structured<T: serde::de::DeserializeOwned>(
+    py: Python<'_>,
+    value: &Bound<'_, PyAny>,
+    many: bool,
+    cap: usize,
+) -> PyResult<T> {
+    let value = bounded_value(py, value, 0, &mut (8 * 1024 * 1024), cap)?;
+    let valid = if many {
+        value
+            .as_array()
+            .is_some_and(|items| items.iter().all(controlled_object_shape))
+    } else {
+        controlled_object_shape(&value)
+    };
+    if !valid {
+        return Err(invalid_controlled(py));
+    }
+    serde_json::from_value(value).map_err(|_| invalid_controlled(py))
+}
 fn parse_bounded<T: serde::de::DeserializeOwned>(
     py: Python<'_>,
     value: &Bound<'_, PyAny>,
@@ -406,7 +438,7 @@ impl PyControlledStore {
     }
     fn seed(&self, py: Python<'_>, projections: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
         let s = self.handle(py)?;
-        let p = parse_controlled(py, projections)?;
+        let p = parse_structured(py, projections, true, 100)?;
         controlled_result(py, py.allow_threads(|| s.seed(p)))
     }
     fn finish_snapshot(&self, py: Python<'_>, position: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
@@ -432,7 +464,7 @@ impl PyControlledStore {
         position: &Bound<'_, PyAny>,
     ) -> PyResult<Py<PyAny>> {
         let s = self.handle(py)?;
-        let m = parse_controlled(py, mutations)?;
+        let m = parse_structured(py, mutations, true, 100)?;
         let p = parse_controlled(py, position)?;
         controlled_result(py, py.allow_threads(|| s.apply_batch(m, p)))
     }
@@ -443,7 +475,7 @@ impl PyControlledStore {
         position: &Bound<'_, PyAny>,
     ) -> PyResult<Py<PyAny>> {
         let s = self.handle(py)?;
-        let m = parse_controlled(py, projection)?;
+        let m = parse_structured(py, projection, false, 100)?;
         let p = parse_controlled(py, position)?;
         controlled_result(py, py.allow_threads(|| s.upsert(m, p)))
     }
@@ -454,7 +486,7 @@ impl PyControlledStore {
         position: &Bound<'_, PyAny>,
     ) -> PyResult<Py<PyAny>> {
         let s = self.handle(py)?;
-        let m = parse_controlled(py, deletion)?;
+        let m = parse_structured(py, deletion, false, 100)?;
         let p = parse_controlled(py, position)?;
         controlled_result(py, py.allow_threads(|| s.delete(m, p)))
     }
@@ -468,7 +500,8 @@ impl PyControlledStore {
     ) -> PyResult<Py<PyAny>> {
         let s = self.handle(py)?;
         let query: String = parse_controlled(py, query)?;
-        let scopes: Vec<cortex_core::controlled::Scope> = parse_bounded(py, allowed_scopes, 64)?;
+        let scopes: Vec<cortex_core::controlled::Scope> =
+            parse_structured(py, allowed_scopes, true, 64)?;
         let mut limit: usize = 10;
         let mut embedding: Option<Vec<f32>> = None;
         let mut max_candidates: usize = 1000;

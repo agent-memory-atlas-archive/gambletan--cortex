@@ -925,6 +925,38 @@ else:
                                       embedding=[1.0, 0.0])["hits"][0]
         self.assertGreater(match["score"], unrelated["score"])
 
+    def test_structured_objects_reject_positional_lists_without_mutation(self):
+        scope_list = ["owner", SCOPE["id"]]
+        source_list = ["input", "bot", "id"]
+        projected = projection(revision=2, text="orchid positional replacement")
+        projection_list = [projected["memory_id"], projected["revision"], projected["scope"],
+                           projected["kind"], projected["text"], projected["source_refs"],
+                           None, None, None]
+        deletion_list = ["memory-one", 2, dict(SCOPE)]
+        cases = [
+            ("allowed_scope", lambda store: store.search("orchid", [scope_list])),
+            ("projection_scope", lambda store: store.upsert(dict(projected, scope=scope_list), 101)),
+            ("source_ref", lambda store: store.upsert(dict(projected, source_refs=[source_list]), 101)),
+            ("deletion_scope", lambda store: store.delete(dict(deletion(), scope=scope_list), 101)),
+            ("projection", lambda store: store.upsert(projection_list, 101)),
+            ("deletion", lambda store: store.delete(deletion_list, 101)),
+            ("batch_projection", lambda store: store.apply_batch([upsert(projection_list)], 101)),
+            ("batch_deletion", lambda store: store.apply_batch(
+                [{"op": "delete", "deletion": deletion_list}], 101)),
+        ]
+        for index, (name, call) in enumerate(cases):
+            store = self.ready([projection()], replica="dict-shape-%d" % index)
+            with self.subTest(case=name, check="invalid_input"):
+                self.error("invalid_input", call, store)
+            # Separate subtests retain state-integrity evidence even if the
+            # malformed call unexpectedly succeeds instead of raising.
+            with self.subTest(case=name, check="position_unchanged"):
+                self.assertEqual(store.status()["position"], 100)
+            with self.subTest(case=name, check="payload_unchanged"):
+                hits = self.hits(store)
+                self.assertEqual([(hit["memory_id"], hit["revision"], hit["text"]) for hit in hits],
+                                 [("memory-one", 1, "orchid report preference")])
+
     def test_restored_local_transaction_loss_rejects_remote_cursor(self):
         store = self.ready([projection()])
         state = store.status()

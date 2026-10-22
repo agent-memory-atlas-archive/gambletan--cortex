@@ -167,7 +167,24 @@ impl OpLogWriter {
             loop {
                 let name = format!("oplog-{}-{:03}.jsonl", self.current_date, self.current_seq);
                 let path = self.device_dir.join(&name);
-                if !path.exists() || fs::metadata(&path).map(|m| m.len()).unwrap_or(0) < MAX_FILE_SIZE {
+                // Never append an acknowledged operation onto a crash-truncated
+                // record. Preserve that file and rotate; readers retain its cursor
+                // independently and continue with the next file.
+                let appendable = match File::open(&path) {
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+                    Err(e) => return Err(CortexError::Storage(format!("Failed to inspect oplog: {e}"))),
+                    Ok(mut existing) => {
+                        use std::io::{Read, Seek, SeekFrom};
+                        let size = existing.metadata().map_err(|e| CortexError::Storage(e.to_string()))?.len();
+                        if size == 0 { true } else if size >= MAX_FILE_SIZE { false } else {
+                            existing.seek(SeekFrom::End(-1)).map_err(|e| CortexError::Storage(e.to_string()))?;
+                            let mut last = [0u8;1];
+                            existing.read_exact(&mut last).map_err(|e| CortexError::Storage(e.to_string()))?;
+                            last[0] == b'\n'
+                        }
+                    }
+                };
+                if appendable {
                     self.current_path = path;
                     break;
                 }

@@ -1227,3 +1227,48 @@ fn test_manifest_without_hmac_is_rejected() {
         "an encryption manifest with its HMAC stripped must be rejected (downgrade/tamper defense)"
     );
 }
+
+fn assert_oplog_restart_rotates_incomplete_tail(encrypted: bool) {
+    let tmp = TempDir::new().unwrap();
+    let sync_dir = tmp.path().join("sync");
+    let config = |device| {
+        let config = make_sync_config(&sync_dir, device);
+        if encrypted { config.with_encryption("test-only-restart-passphrase") } else { config }
+    };
+    let cortex_a = Cortex::in_memory().unwrap();
+    let make = |text: &str| {
+        let mut memory = MemObjectBuilder::new(MemoryTier::Episodic, MemContent::Text(text.into()), MemSource::new("test")).build();
+        memory.privacy = PrivacyLevel::Shared { scope: "all".into() };
+        memory
+    };
+    let first = make("complete before torn append");
+    let torn = make("crash truncated record");
+    let next = make("first acknowledged operation after restart");
+    let mut writer = SyncEngine::new(config("restart-device"),cortex_a.sqlite_storage()).unwrap();
+    writer.record_op(SyncPayload::MemoryUpsert { memory: first.clone() }).unwrap();
+    writer.record_op(SyncPayload::MemoryUpsert { memory: torn.clone() }).unwrap();
+    drop(writer);
+    let old = oplog::list_oplog_files(&sync_dir.join("devices/restart-device")).unwrap().remove(0);
+    let length = std::fs::metadata(&old).unwrap().len();
+    std::fs::OpenOptions::new().write(true).open(&old).unwrap().set_len(length-7).unwrap();
+    let mut restarted = SyncEngine::new(config("restart-device"),cortex_a.sqlite_storage()).unwrap();
+    restarted.record_op(SyncPayload::MemoryUpsert { memory: next.clone() }).unwrap();
+    drop(restarted);
+    assert_eq!(std::fs::metadata(&old).unwrap().len(),length-7,"torn history must be preserved");
+    let cortex_b = Cortex::in_memory().unwrap();
+    let mut receiver = SyncEngine::new(config("receiver"),cortex_b.sqlite_storage()).unwrap();
+    assert_eq!(receiver.pull_remote(cortex_b.sqlite_storage(),cortex_b.index()).unwrap(),2);
+    for memory in [&first,&next] {
+        assert_eq!(serde_json::to_value(cortex_b.storage().get_memory(memory.id).unwrap().unwrap().content).unwrap(),serde_json::to_value(&memory.content).unwrap());
+    }
+    assert!(cortex_b.storage().get_memory(torn.id).unwrap().is_none());
+    assert_eq!(receiver.pull_remote(cortex_b.sqlite_storage(),cortex_b.index()).unwrap(),0);
+    drop(receiver);
+    let mut receiver = SyncEngine::new(config("receiver"),cortex_b.sqlite_storage()).unwrap();
+    assert_eq!(receiver.pull_remote(cortex_b.sqlite_storage(),cortex_b.index()).unwrap(),0);
+}
+
+#[test]
+fn test_oplog_restart_after_plaintext_partial_append() { assert_oplog_restart_rotates_incomplete_tail(false); }
+#[test]
+fn test_oplog_restart_after_encrypted_partial_append() { assert_oplog_restart_rotates_incomplete_tail(true); }

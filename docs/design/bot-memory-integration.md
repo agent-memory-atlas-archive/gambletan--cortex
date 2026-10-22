@@ -171,7 +171,7 @@ Use synthetic memory identities/text, real temporary SQLite and real test Postgr
 
 An acceptance subagent must be context-isolated from implementation: give it this plan and public schemas/docs, not implementation diffs or unit tests. Implementers write unit tests separately. Adversarial review is a third independent context, per repository rules.
 
-Cortex-side automated evidence includes the independent installed-wheel acceptance suite (31 cases exercising Cortex-side portions of C01-C13 and local crash/restore parts of C16), core unit fault injection and legacy regression suites. The public timing-based crash cases establish restart consistency; separate native test-only barriers deterministically terminate a real subprocess inside the transaction and after commit before cache invalidation/response. These establish process-crash behavior, not power-loss durability or a real-PG replay handshake. C14-C18 still require the Bot/Studio adapter and real PostgreSQL; no passing local test substitutes for those.
+Cortex-side automated evidence includes the independent installed-wheel acceptance suite (32 cases exercising Cortex-side portions of C01-C13 and local crash/restore parts of C16), core unit fault injection and legacy regression suites. The public timing-based crash cases establish restart consistency; separate native test-only barriers deterministically terminate a real subprocess inside the transaction and after commit before cache invalidation/response. These establish process-crash behavior, not power-loss durability or a real-PG replay handshake. C14-C18 still require the Bot/Studio adapter and real PostgreSQL; no passing local test substitutes for those.
 
 ## 9. Review, CI, rollout and evidence
 
